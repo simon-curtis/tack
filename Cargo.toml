@@ -1,0 +1,40 @@
+# tack workspace. tack-core is the engine (the agent SDK); tack-cli is one client.
+[workspace]
+resolver = "3"
+members = ["crates/tack-core", "crates/tack-cli"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/simon-curtis/tack"
+authors = ["Simon Curtis"]
+
+# Versions verified live against crates.io (see DESIGN.md). Pinned to the minor;
+# exact patches are locked in the committed Cargo.lock.
+[workspace.dependencies]
+blake3 = "1.8"
+fastcdc = "4.0"
+zstd = "0.13"
+# Line/word diffing for content-level (`--patch` / `--stat`) diffs. Default
+# features (std + text) give `TextDiff::from_lines`; that is all we use.
+similar = "3.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2.0"
+anyhow = "1.0"
+notify = "8.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3.27"
+proptest = "1.11"
+# ProjFS is Windows-only + optional; the dynamic-import feature loads
+# ProjectedFSLib.dll at runtime so the binary links even where it is absent.
+windows-projfs = { version = "0.1.7", default-features = false, features = ["dynamic-import"] }
+
+# Internal crate.
+tack-core = { path = "crates/tack-core" }
+
+[profile.release]
+lto = "thin"

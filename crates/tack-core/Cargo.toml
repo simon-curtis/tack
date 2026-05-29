@@ -1,0 +1,32 @@
+[package]
+name = "tack-core"
+description = "tack engine: content-addressed object store, operation log, snapshots, diff, restore, and the agent API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+default = []
+# Windows ProjFS lazy filesystem projection.
+projfs = ["dep:windows-projfs"]
+
+[dependencies]
+blake3.workspace = true
+fastcdc.workspace = true
+zstd.workspace = true
+similar.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+notify.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-projfs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

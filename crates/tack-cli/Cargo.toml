@@ -1,0 +1,29 @@
+[package]
+name = "tack-cli"
+description = "the tack command-line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "tack"
+path = "src/main.rs"
+
+[features]
+default = []
+# Forward the ProjFS projection feature to tack-core.
+projfs = ["tack-core/projfs"]
+
+[dependencies]
+tack-core.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

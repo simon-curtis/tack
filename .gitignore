@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# tack's own repo dir should never be committed into tack's source tree
+.tack/
