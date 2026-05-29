@@ -357,7 +357,7 @@ fn hook_entry(exe_path: &Path, matcher: &str) -> Value {
         "matcher": matcher,
         "hooks": [{
             "type": "command",
-            "command": format!("\"{}\" hook pre-tool-use", exe_path.display()),
+            "command": our_hook_command(exe_path),
             "timeout": 10,
         }]
     })
@@ -365,7 +365,40 @@ fn hook_entry(exe_path: &Path, matcher: &str) -> Value {
 
 /// The command string used to identify our hook entry (for deduplication).
 fn our_hook_command(exe_path: &Path) -> String {
+    if cfg!(windows) {
+        return format!("& \"{}\" hook pre-tool-use", exe_path.display());
+    }
+
+    legacy_shell_hook_command(exe_path)
+}
+
+/// The old shell-style command string written by earlier installers.
+fn legacy_shell_hook_command(exe_path: &Path) -> String {
     format!("\"{}\" hook pre-tool-use", exe_path.display())
+}
+
+fn managed_hook_commands(exe_path: &Path) -> Vec<String> {
+    let current = our_hook_command(exe_path);
+    let legacy = legacy_shell_hook_command(exe_path);
+
+    if current == legacy {
+        vec![current]
+    } else {
+        vec![current, legacy]
+    }
+}
+
+fn hook_entry_has_command(entry: &Value, predicate: impl Fn(&str) -> bool) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(&predicate)
+            })
+        })
 }
 
 /// Merges our `PreToolUse` hook entry into `value` under `hooks.PreToolUse`.
@@ -388,26 +421,26 @@ fn merge_hook_entry(value: &mut Value, exe_path: &Path, matcher: &str) -> bool {
         .as_array_mut()
         .expect("PreToolUse must be an array");
 
-    let our_command = our_hook_command(exe_path);
+    let current_command = our_hook_command(exe_path);
+    let managed_commands = managed_hook_commands(exe_path);
 
-    // Check for an existing entry with the same command (dedup).
-    let already_present = arr.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c == our_command)
-                })
-            })
+    let already_current = arr
+        .iter()
+        .any(|entry| hook_entry_has_command(entry, |c| c == current_command));
+    let has_legacy = arr.iter().any(|entry| {
+        hook_entry_has_command(entry, |c| {
+            c != current_command && managed_commands.iter().any(|cmd| cmd == c)
+        })
     });
 
-    if already_present {
+    if already_current && !has_legacy {
         return false; // Nothing to add.
     }
 
+    // Replace old managed hook commands with the current platform-correct form.
+    arr.retain(|entry| {
+        !hook_entry_has_command(entry, |c| managed_commands.iter().any(|cmd| cmd == c))
+    });
     arr.push(hook_entry(exe_path, matcher));
     true
 }
@@ -427,19 +460,10 @@ fn remove_hook_entry(value: &mut Value, exe_path: &Path) -> bool {
         return false;
     };
 
-    let our_command = our_hook_command(exe_path);
+    let managed_commands = managed_hook_commands(exe_path);
     let before = arr.len();
     arr.retain(|entry| {
-        !entry
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .is_some_and(|hooks| {
-                hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| c == our_command)
-                })
-            })
+        !hook_entry_has_command(entry, |c| managed_commands.iter().any(|cmd| cmd == c))
     });
     arr.len() < before
 }
@@ -910,6 +934,18 @@ mod tests {
         PathBuf::from(r"C:\fake\tack.exe")
     }
 
+    // ── hook command generation ──────────────────────────────────────────────
+
+    #[test]
+    fn hook_command_uses_platform_shell_syntax() {
+        let command = our_hook_command(&fake_exe());
+        if cfg!(windows) {
+            assert_eq!(command, r#"& "C:\fake\tack.exe" hook pre-tool-use"#);
+        } else {
+            assert_eq!(command, r#""C:\fake\tack.exe" hook pre-tool-use"#);
+        }
+    }
+
     // ── upsert_block ──────────────────────────────────────────────────────────
 
     #[test]
@@ -993,6 +1029,32 @@ mod tests {
     }
 
     #[test]
+    fn merge_hook_entry_replaces_legacy_shell_command() {
+        let exe = fake_exe();
+        let legacy_command = legacy_shell_hook_command(&exe);
+        let mut value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": legacy_command,
+                            "timeout": 10
+                        }]
+                    }
+                ]
+            }
+        });
+
+        let changed = merge_hook_entry(&mut value, &exe, "Bash");
+        let arr = value["hooks"]["PreToolUse"].as_array().expect("array");
+        assert_eq!(arr.len(), 1, "legacy entry must not be duplicated");
+        assert_eq!(arr[0]["hooks"][0]["command"], our_hook_command(&exe));
+        assert_eq!(changed, cfg!(windows));
+    }
+
+    #[test]
     fn merge_hook_entry_preserves_unrelated_keys() {
         let exe = fake_exe();
         let mut value = serde_json::json!({ "customKey": "preserved", "other": 42 });
@@ -1031,6 +1093,31 @@ mod tests {
         let exe = fake_exe();
         let mut value = Value::Object(serde_json::Map::new());
         merge_hook_entry(&mut value, &exe, "Bash");
+        let removed = remove_hook_entry(&mut value, &exe);
+        assert!(removed);
+        let arr = value["hooks"]["PreToolUse"].as_array().expect("array");
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn remove_hook_entry_removes_legacy_shell_command() {
+        let exe = fake_exe();
+        let legacy_command = legacy_shell_hook_command(&exe);
+        let mut value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": legacy_command,
+                            "timeout": 10
+                        }]
+                    }
+                ]
+            }
+        });
+
         let removed = remove_hook_entry(&mut value, &exe);
         assert!(removed);
         let arr = value["hooks"]["PreToolUse"].as_array().expect("array");
