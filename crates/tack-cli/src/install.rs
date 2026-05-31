@@ -49,6 +49,10 @@ fn instruction_block_content() -> String {
          | Diff with content | `tack diff --patch` |\n\
          | Named-cut history | `tack log` |\n\
          | All cuts across lineages | `tack cuts` |\n\
+         | Release/team lanes | `tack lanes` |\n\
+         | Admit a cut to a lane | `tack admit <cut> --to <lane> --reason \"why\"` |\n\
+         | Backport a fix to a lane | `tack backport <source-cut> --to <lane> --admit` |\n\
+         | Finish a conflicted backport | `tack backport --continue --admit` |\n\
          | Restore to a cut/op | `tack restore --to <id>` |\n\
          | Undo last operation | `tack undo` |\n\
          | Claim a file (advisory) | `tack claim <path>` |\n\
@@ -56,6 +60,10 @@ fn instruction_block_content() -> String {
          \n\
          A `PreToolUse` hook is installed: any `git` invocation will be blocked\n\
          with a reminder of the equivalent tack command.\n\
+         \n\
+         There is no git-style branch, rebase, fast-forward, merge, or\n\
+         cherry-pick flow. Use lane admission plus `tack backport` for release\n\
+         hotfixes.\n\
          \n\
          {BLOCK_END}"
     )
@@ -1219,6 +1227,9 @@ mod tests {
         let md = fs::read_to_string(root.join("CLAUDE.md")).expect("read CLAUDE.md");
         assert!(md.contains(BLOCK_BEGIN));
         assert!(md.contains("tack snap"));
+        assert!(md.contains("tack lanes"));
+        assert!(md.contains("tack admit <cut> --to <lane>"));
+        assert!(md.contains("tack backport <source-cut> --to <lane> --admit"));
 
         let json: Value = serde_json::from_str(
             &fs::read_to_string(root.join(".claude").join("settings.json")).expect("read settings"),

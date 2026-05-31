@@ -280,6 +280,190 @@ pub fn cuts(out: &mut impl Write, format: OutputFormat) -> Result<()> {
     log(out, format, true)
 }
 
+// ── lanes / admit / backport ────────────────────────────────────────────────
+
+/// `tack lanes` — list op-derived team/release lanes.
+///
+/// # Errors
+///
+/// Fails if the repository cannot be opened or lanes cannot be read.
+pub fn lanes(out: &mut impl Write, format: OutputFormat) -> Result<()> {
+    let repo = open_repo()?;
+    let response = api::handle(&repo, Request::Lanes);
+    if format == OutputFormat::Json {
+        return emit_json(out, &response);
+    }
+    let Response::Lanes { lanes } = &response else {
+        return render_error(out, &response);
+    };
+    if lanes.is_empty() {
+        writeln!(out, "no lanes").context("failed to write output")?;
+        return Ok(());
+    }
+    for lane in lanes {
+        writeln!(
+            out,
+            "{} {} (admitted by {})",
+            lane.name,
+            short(&lane.cut),
+            short(&lane.admission)
+        )
+        .context("failed to write output")?;
+    }
+    Ok(())
+}
+
+/// `tack admit <cut> --to <lane>` — admit a cut to a lane.
+///
+/// # Errors
+///
+/// Fails if the repository cannot be opened, the cut cannot be resolved, or the
+/// admission cannot be recorded.
+pub fn admit(
+    out: &mut impl Write,
+    format: OutputFormat,
+    cut: String,
+    lane: String,
+    reason: Option<String>,
+) -> Result<()> {
+    let repo = open_repo()?;
+    let response = api::handle(
+        &repo,
+        Request::Admit {
+            cut,
+            lane,
+            reason: reason.unwrap_or_default(),
+        },
+    );
+    if format == OutputFormat::Json {
+        return emit_json(out, &response);
+    }
+    match &response {
+        Response::Admitted { data } => writeln!(
+            out,
+            "admitted {} to {} (op {})",
+            short(&data.cut),
+            data.lane,
+            short(&data.op)
+        )
+        .context("failed to write output"),
+        other => render_error(out, other),
+    }
+}
+
+/// `tack backport <source> --to <lane>` or `tack backport --continue`.
+///
+/// # Errors
+///
+/// Fails if the repository cannot be opened or the backport cannot be created
+/// or continued.
+#[allow(clippy::too_many_arguments)]
+pub fn backport(
+    out: &mut impl Write,
+    format: OutputFormat,
+    source: Option<String>,
+    target_lane: Option<String>,
+    message: Option<String>,
+    reason: Option<String>,
+    continue_settlement: bool,
+    admit: bool,
+) -> Result<()> {
+    let repo = open_repo()?;
+    let author = Author::from_env();
+    let request = if continue_settlement {
+        if source.is_some() || target_lane.is_some() || message.is_some() || reason.is_some() {
+            return Err(anyhow::anyhow!(
+                "`tack backport --continue` does not take source, --to, -m, or --reason"
+            ));
+        }
+        Request::BackportContinue {
+            author_name: author.name,
+            author_email: author.email,
+            admit,
+        }
+    } else {
+        let source =
+            source.ok_or_else(|| anyhow::anyhow!("`tack backport` requires a source cut"))?;
+        let target_lane =
+            target_lane.ok_or_else(|| anyhow::anyhow!("`tack backport` requires --to <lane>"))?;
+        Request::Backport {
+            source,
+            target_lane,
+            message,
+            reason: reason.unwrap_or_default(),
+            author_name: author.name,
+            author_email: author.email,
+            admit,
+        }
+    };
+    let response = api::handle(&repo, request);
+    if format == OutputFormat::Json {
+        return emit_json(out, &response);
+    }
+    match &response {
+        Response::Backport { data } => render_backport(out, data),
+        other => render_error(out, other),
+    }
+}
+
+fn render_backport(out: &mut impl Write, data: &api::BackportData) -> Result<()> {
+    match data.outcome.as_str() {
+        "created" => {
+            let cut = data.cut.as_deref().unwrap_or("<none>");
+            writeln!(
+                out,
+                "backport {} to {} created {} ({})",
+                short(&data.provenance.source_cut),
+                data.provenance.target_lane,
+                short(cut),
+                data.method
+            )
+            .context("failed to write output")?;
+        }
+        "already_ported" => {
+            let cut = data.cut.as_deref().unwrap_or("<none>");
+            writeln!(
+                out,
+                "already backported {} to {} as {}",
+                short(&data.provenance.source_cut),
+                data.provenance.target_lane,
+                short(cut)
+            )
+            .context("failed to write output")?;
+        }
+        "settlement" => {
+            writeln!(
+                out,
+                "backport {} to {} needs settlement",
+                short(&data.provenance.source_cut),
+                data.provenance.target_lane
+            )
+            .context("failed to write output")?;
+            for conflict in &data.conflicts {
+                writeln!(out, "  conflict {conflict}").context("failed to write output")?;
+            }
+            writeln!(
+                out,
+                "resolve the working copy, then run `tack backport --continue`"
+            )
+            .context("failed to write output")?;
+        }
+        other => {
+            writeln!(out, "backport outcome {other}").context("failed to write output")?;
+        }
+    }
+    if let Some(admission) = &data.admission {
+        writeln!(
+            out,
+            "admitted to {} (op {})",
+            admission.lane,
+            short(&admission.op)
+        )
+        .context("failed to write output")?;
+    }
+    Ok(())
+}
+
 // ── op log ──────────────────────────────────────────────────────────────────
 
 /// `tack op log` — print the operation log, newest-first.

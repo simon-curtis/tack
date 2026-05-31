@@ -357,6 +357,8 @@ Methods (request `method` tag → response `status` tag):
 | `help` | self-description of every method (params + response shape) |
 | `claims` / `claim` / `release` | advisory path claims (§13) |
 | `scoped_cut` | a cut capturing only selected paths (§13) |
+| `lanes` / `admit` | op-derived team/release lanes (§13) |
+| `backport` / `backport_continue` | release-lane backports and settlement (§13) |
 
 Responses carry both full ids and `*_short` (12-hex) forms. The API is
 **self-describing** via `help`, so an agent need not infer method shapes. Author
@@ -382,6 +384,10 @@ e-mail is accepted as input but **never echoed** in any response (org data rule)
 | `tack cat <id>` / `tack ls <tree>` | inspect objects |
 | `tack schema` | print the agent-API self-description (the JSON `help` method) |
 | `tack claim <path> [--as H] [--note N]` / `tack release <path> [--as H]` / `tack claims` | advisory claims (§13) |
+| `tack lanes` | list op-derived team/release lanes |
+| `tack admit <cut> --to <lane> [--reason R]` | admit a cut to a lane |
+| `tack backport <cut> --to <lane> [-m MSG] [--reason R] [--admit]` | create a release-lane backport proposal |
+| `tack backport --continue [--admit]` | finish the current manual backport settlement |
 | `tack serve` | JSON-RPC agent server over stdio |
 | `tack mount <dir>` *(feature=projfs)* | project a snapshot as a virtual dir |
 
@@ -430,6 +436,37 @@ snapshot, and records the result as a named cut on a side **head** (reachable vi
 workers are unaffected. The outcome reports the **captured** in-scope paths and
 the **`outside_changes`** — out-of-scope paths that differ from `base` (uncaptured
 concurrent work a coordinator may want to know about).
+
+### Lanes, admission, and backports
+
+Lanes are local, op-derived team/release views such as `team/main` or
+`release/7.8.0`. `admit` records an ordinary op whose view is unchanged and
+whose command encodes the lane, admitted cut, and reason. Folding those ops
+oldest-to-newest yields the current lane map. This keeps lane decisions in the
+op-log without a format bump and without treating `View.bookmarks` as branch
+state.
+
+`backport` creates a new target-lane realization of a source fix cut. The source
+cut must have exactly one snapshot parent in v1. The source effect is computed
+from `source_parent -> source_cut` and applied onto the target lane's current
+admitted cut:
+
+- clean adds/modifies/deletes create a side-head cut parented only on the target
+  lane cut;
+- the source cut is recorded as provenance in the backport op command, never as
+  a snapshot parent;
+- `--admit` appends a separate admission op after the backport op.
+
+If the effect does not apply cleanly, tack materializes a settlement working copy
+parented on the target lane cut, leaves conflicting paths at the target version,
+and records a pending backport settlement op. After the user resolves the working
+copy, `backport --continue` finalizes a manual target-lane cut with the original
+provenance; `--admit` again records a separate admission op.
+
+Backport idempotence is derived from op-log provenance: the same source cut and
+target lane is already ported, while the same source `change_id` on the same
+target lane is treated as a related duplicate that requires an explicit human
+decision.
 
 ---
 

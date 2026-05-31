@@ -115,6 +115,21 @@ enum Command {
     Current,
     /// List every named cut across all lineages (alias for `log --all`).
     Cuts,
+    /// List op-derived team/release lanes.
+    Lanes,
+    /// Admit a cut to a team/release lane.
+    Admit {
+        /// The cut id or unique prefix to admit.
+        cut: String,
+        /// The target lane.
+        #[arg(long = "to")]
+        lane: String,
+        /// Optional admission reason.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Backport a source cut to a release lane, or continue a settlement.
+    Backport(BackportArgs),
     /// List the currently-held advisory claims.
     Claims,
     /// Record an advisory claim on a path (advisory only — never enforced).
@@ -214,6 +229,28 @@ struct DiffArgs {
     patch: bool,
 }
 
+/// Arguments for `tack backport`.
+#[derive(Debug, Args)]
+struct BackportArgs {
+    /// The source fix cut id/prefix. Omit with `--continue`.
+    source: Option<String>,
+    /// The target lane.
+    #[arg(long = "to")]
+    target_lane: Option<String>,
+    /// Optional target cut message.
+    #[arg(short, long)]
+    message: Option<String>,
+    /// Optional backport reason.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Finish the current manual backport settlement.
+    #[arg(long = "continue")]
+    continue_settlement: bool,
+    /// Also admit the resulting cut when one is created.
+    #[arg(long)]
+    admit: bool,
+}
+
 fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
@@ -272,6 +309,18 @@ fn run(out: &mut impl Write, command: Command, format: OutputFormat) -> anyhow::
         Command::Schema => commands::schema(out, format),
         Command::Current => commands::current(out, format),
         Command::Cuts => commands::cuts(out, format),
+        Command::Lanes => commands::lanes(out, format),
+        Command::Admit { cut, lane, reason } => commands::admit(out, format, cut, lane, reason),
+        Command::Backport(args) => commands::backport(
+            out,
+            format,
+            args.source,
+            args.target_lane,
+            args.message,
+            args.reason,
+            args.continue_settlement,
+            args.admit,
+        ),
         Command::Claims => commands::claims(out, format),
         Command::Claim { path, holder, note } => commands::claim(out, format, path, holder, note),
         Command::Release { path, holder } => commands::release(out, format, path, holder),
@@ -386,9 +435,65 @@ mod tests {
             Command::Claims
         ));
         assert!(matches!(
+            Cli::parse_from(["tack", "lanes"]).command,
+            Command::Lanes
+        ));
+        assert!(matches!(
             Cli::parse_from(["tack", "schema"]).command,
             Command::Schema
         ));
+    }
+
+    #[test]
+    fn parses_admit_and_backport() {
+        let cli = Cli::parse_from([
+            "tack",
+            "admit",
+            "deadbeef",
+            "--to",
+            "release/7.8.0",
+            "--reason",
+            "seed",
+        ]);
+        let Command::Admit { cut, lane, reason } = cli.command else {
+            panic!("expected admit");
+        };
+        assert_eq!(cut, "deadbeef");
+        assert_eq!(lane, "release/7.8.0");
+        assert_eq!(reason.as_deref(), Some("seed"));
+
+        let cli = Cli::parse_from([
+            "tack",
+            "backport",
+            "abc123",
+            "--to",
+            "release/7.8.0",
+            "-m",
+            "hotfix",
+            "--reason",
+            "customer",
+            "--admit",
+        ]);
+        let Command::Backport(args) = cli.command else {
+            panic!("expected backport");
+        };
+        assert_eq!(args.source.as_deref(), Some("abc123"));
+        assert_eq!(args.target_lane.as_deref(), Some("release/7.8.0"));
+        assert_eq!(args.message.as_deref(), Some("hotfix"));
+        assert_eq!(args.reason.as_deref(), Some("customer"));
+        assert!(args.admit);
+        assert!(!args.continue_settlement);
+    }
+
+    #[test]
+    fn parses_backport_continue() {
+        let cli = Cli::parse_from(["tack", "backport", "--continue", "--admit"]);
+        let Command::Backport(args) = cli.command else {
+            panic!("expected backport");
+        };
+        assert!(args.continue_settlement);
+        assert!(args.admit);
+        assert!(args.source.is_none());
     }
 
     #[test]

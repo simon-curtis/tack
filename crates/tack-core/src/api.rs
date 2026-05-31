@@ -27,7 +27,10 @@ use crate::error::Result;
 use crate::hash::ObjectId;
 use crate::linediff::{FilePatch, FileStat};
 use crate::object::{Identity, Op, Snapshot};
-use crate::repo::Repository;
+use crate::repo::{
+    AdmissionOutcome, BackportOutcome, BackportProvenance, BackportRecord, BackportSettlement,
+    Lane, Repository,
+};
 use crate::tree::list_tree;
 use crate::workcopy::Status;
 
@@ -144,6 +147,48 @@ pub enum Request {
         /// base cut.
         #[serde(default)]
         base: Option<String>,
+    },
+    /// List op-derived team lanes and their current admitted cuts.
+    Lanes,
+    /// Admit a cut to a team/release lane.
+    Admit {
+        /// The cut id or prefix to admit.
+        cut: String,
+        /// The lane to admit the cut into.
+        lane: String,
+        /// Optional admission reason.
+        #[serde(default)]
+        reason: String,
+    },
+    /// Create a backport proposal from a source cut to a target lane.
+    Backport {
+        /// The source fix cut id or prefix.
+        source: String,
+        /// The target lane name.
+        target_lane: String,
+        /// Optional target cut message.
+        #[serde(default)]
+        message: Option<String>,
+        /// Optional backport reason.
+        #[serde(default)]
+        reason: String,
+        /// The author's display name.
+        author_name: String,
+        /// The author's e-mail address (input only; never echoed back).
+        author_email: String,
+        /// Also admit the created cut when the backport is clean/manual.
+        #[serde(default)]
+        admit: bool,
+    },
+    /// Finish the currently materialized manual backport settlement.
+    BackportContinue {
+        /// The author's display name.
+        author_name: String,
+        /// The author's e-mail address (input only; never echoed back).
+        author_email: String,
+        /// Also admit the resulting cut.
+        #[serde(default)]
+        admit: bool,
     },
 }
 
@@ -286,7 +331,11 @@ impl DiffTarget {
     /// Classifies a resolved `to` argument: `None` is the live working copy, a
     /// snapshot id is a recorded snapshot.
     const fn from_to(to: Option<ObjectId>) -> Self {
-        if to.is_some() { Self::Snapshot } else { Self::LiveWorkingCopy }
+        if to.is_some() {
+            Self::Snapshot
+        } else {
+            Self::LiveWorkingCopy
+        }
     }
 }
 
@@ -401,6 +450,99 @@ pub struct ScopedCutData {
     pub outside_changes: Vec<String>,
 }
 
+/// One op-derived lane for [`Request::Lanes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneData {
+    /// The lane name.
+    pub name: String,
+    /// The currently admitted cut id (hex).
+    pub cut: String,
+    /// The first 12 hex chars of [`cut`](Self::cut).
+    pub cut_short: String,
+    /// The op that admitted the current cut (hex).
+    pub admission: String,
+    /// The first 12 hex chars of [`admission`](Self::admission).
+    pub admission_short: String,
+    /// The admission reason, if any.
+    pub reason: String,
+    /// Admission timestamp, seconds since the Unix epoch.
+    pub timestamp: i64,
+}
+
+/// The result of an admission operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionData {
+    /// The lane name.
+    pub lane: String,
+    /// The admitted cut id (hex).
+    pub cut: String,
+    /// The first 12 hex chars of [`cut`](Self::cut).
+    pub cut_short: String,
+    /// The op that recorded the admission (hex).
+    pub op: String,
+    /// The first 12 hex chars of [`op`](Self::op).
+    pub op_short: String,
+    /// The admission reason, if any.
+    pub reason: String,
+}
+
+/// A source admission referenced by backport provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAdmissionData {
+    /// The lane that admitted the source cut.
+    pub lane: String,
+    /// The source admission op id (hex).
+    pub op: String,
+    /// The first 12 hex chars of [`op`](Self::op).
+    pub op_short: String,
+}
+
+/// Provenance for a backport result or settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackportProvenanceData {
+    /// The source fix cut id (hex).
+    pub source_cut: String,
+    /// The first 12 hex chars of [`source_cut`](Self::source_cut).
+    pub source_cut_short: String,
+    /// The source logical change id (hex).
+    pub source_change_id: String,
+    /// The first 12 hex chars of [`source_change_id`](Self::source_change_id).
+    pub source_change_id_short: String,
+    /// The source lane admission, if discoverable.
+    pub source_admission: Option<SourceAdmissionData>,
+    /// The target lane.
+    pub target_lane: String,
+    /// The target base cut id (hex).
+    pub target_base: String,
+    /// The first 12 hex chars of [`target_base`](Self::target_base).
+    pub target_base_short: String,
+    /// The backport reason, if any.
+    pub reason: String,
+}
+
+/// The result of [`Request::Backport`] or [`Request::BackportContinue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackportData {
+    /// `created`, `settlement`, or `already_ported`.
+    pub outcome: String,
+    /// The backport provenance.
+    pub provenance: BackportProvenanceData,
+    /// The result cut id when a cut exists (hex).
+    pub cut: Option<String>,
+    /// The first 12 hex chars of [`cut`](Self::cut).
+    pub cut_short: Option<String>,
+    /// The op that recorded the backport or settlement (hex).
+    pub op: Option<String>,
+    /// The first 12 hex chars of [`op`](Self::op).
+    pub op_short: Option<String>,
+    /// `clean`, `manual`, or `settlement`.
+    pub method: String,
+    /// Conflicted paths for settlement outcomes.
+    pub conflicts: Vec<String>,
+    /// Admission data when `admit` was requested and a cut was admitted.
+    pub admission: Option<AdmissionData>,
+}
+
 // ── Response ────────────────────────────────────────────────────────────────────
 
 /// One agent-API response.
@@ -499,6 +641,22 @@ pub enum Response {
         /// The scoped-cut payload.
         data: ScopedCutData,
     },
+    /// The op-derived lanes ([`Request::Lanes`]).
+    Lanes {
+        /// One entry per lane.
+        lanes: Vec<LaneData>,
+    },
+    /// A lane admission ([`Request::Admit`]).
+    Admitted {
+        /// The admission payload.
+        data: AdmissionData,
+    },
+    /// A backport result ([`Request::Backport`] /
+    /// [`Request::BackportContinue`]).
+    Backport {
+        /// The backport payload.
+        data: BackportData,
+    },
     /// Per-file line-count stats ([`Request::Diff`] with `stat`).
     DiffStat {
         /// One entry per changed file.
@@ -558,7 +716,9 @@ pub enum Response {
 impl Response {
     /// Wraps an error message in a [`Response::Error`].
     fn error(message: impl Into<String>) -> Self {
-        Self::Error { message: message.into() }
+        Self::Error {
+            message: message.into(),
+        }
     }
 }
 
@@ -576,20 +736,36 @@ pub fn handle(repo: &Repository, req: Request) -> Response {
 
 /// The fallible inner worker for [`handle`]; `?` short-circuits to an error
 /// response at the call site.
+#[expect(
+    clippy::too_many_lines,
+    reason = "single request dispatch table keeps the public agent API explicit"
+)]
 fn run(repo: &Repository, req: Request) -> Result<Response> {
     match req {
         Request::Status => {
             let status = repo.status()?;
-            Ok(Response::Status { data: StatusData::from_status(&status) })
+            Ok(Response::Status {
+                data: StatusData::from_status(&status),
+            })
         }
         Request::Snapshot => {
             let id = repo.snapshot_working_copy()?;
-            Ok(Response::Snapshot { snapshot: id.to_string(), snapshot_short: id.short() })
+            Ok(Response::Snapshot {
+                snapshot: id.to_string(),
+                snapshot_short: id.short(),
+            })
         }
-        Request::NamedCut { message, author_name, author_email } => {
+        Request::NamedCut {
+            message,
+            author_name,
+            author_email,
+        } => {
             let author = Identity::new(author_name, author_email);
             let cut = repo.named_cut(message, author)?;
-            Ok(Response::NamedCut { cut: cut.to_string(), cut_short: cut.short() })
+            Ok(Response::NamedCut {
+                cut: cut.to_string(),
+                cut_short: cut.short(),
+            })
         }
         Request::Log => {
             let cuts = repo.log()?.iter().map(CutSummary::from_snapshot).collect();
@@ -599,7 +775,12 @@ fn run(repo: &Repository, req: Request) -> Result<Response> {
             let ops = repo.op_log()?.iter().map(OpSummary::from_op).collect();
             Ok(Response::OpLog { ops })
         }
-        Request::Diff { from, to, stat, patch } => run_diff(repo, from.as_deref(), to.as_deref(), stat, patch),
+        Request::Diff {
+            from,
+            to,
+            stat,
+            patch,
+        } => run_diff(repo, from.as_deref(), to.as_deref(), stat, patch),
         Request::Restore { target } => {
             let id = repo.resolve_prefix(&target)?;
             let new_op = repo.restore(id)?;
@@ -641,23 +822,75 @@ fn run(repo: &Repository, req: Request) -> Result<Response> {
                 .collect();
             Ok(Response::Ls { entries })
         }
-        Request::Help => Ok(Response::Help { methods: api_schema() }),
-        Request::Current => Ok(Response::Current { data: current_data(repo)? }),
+        Request::Help => Ok(Response::Help {
+            methods: api_schema(),
+        }),
+        Request::Current => Ok(Response::Current {
+            data: current_data(repo)?,
+        }),
         Request::Cuts => {
-            let cuts = repo.all_cuts()?.iter().map(CutSummary::from_snapshot).collect();
+            let cuts = repo
+                .all_cuts()?
+                .iter()
+                .map(CutSummary::from_snapshot)
+                .collect();
             Ok(Response::Cuts { cuts })
         }
-        Request::Claims => Ok(Response::Claims { claims: repo.claims()? }),
+        Request::Claims => Ok(Response::Claims {
+            claims: repo.claims()?,
+        }),
         Request::Claim { path, holder, note } => run_claim(repo, &path, &holder, &note),
         Request::Release { path, holder } => {
             repo.release(&path, &holder)?;
-            Ok(Response::Claims { claims: repo.claims()? })
+            Ok(Response::Claims {
+                claims: repo.claims()?,
+            })
         }
-        Request::ScopedCut { paths, message, author_name, author_email, base } => {
+        Request::ScopedCut {
+            paths,
+            message,
+            author_name,
+            author_email,
+            base,
+        } => {
             let author = Identity::new(author_name, author_email);
             let base = resolve_opt(repo, base.as_deref())?;
             let outcome = repo.scoped_cut(&paths, message, author, base)?;
-            Ok(Response::ScopedCut { data: scoped_cut_data(&outcome) })
+            Ok(Response::ScopedCut {
+                data: scoped_cut_data(&outcome),
+            })
+        }
+        Request::Lanes => {
+            let lanes = repo.lanes()?.iter().map(lane_data).collect();
+            Ok(Response::Lanes { lanes })
+        }
+        Request::Admit { cut, lane, reason } => {
+            let cut = repo.resolve_prefix(&cut)?;
+            let outcome = repo.admit(cut, &lane, &reason)?;
+            Ok(Response::Admitted {
+                data: admission_data(&outcome),
+            })
+        }
+        Request::Backport {
+            source,
+            target_lane,
+            message,
+            reason,
+            author_name,
+            author_email,
+            admit,
+        } => {
+            let source = repo.resolve_prefix(&source)?;
+            let author = Identity::new(author_name, author_email);
+            run_backport(repo, source, &target_lane, message, &reason, author, admit)
+        }
+        Request::BackportContinue {
+            author_name,
+            author_email,
+            admit,
+        } => {
+            let author = Identity::new(author_name, author_email);
+            run_backport_continue(repo, author, admit)
         }
     }
 }
@@ -770,16 +1003,30 @@ fn run_diff(
     let to = resolve_opt(repo, to)?;
     let to_kind = DiffTarget::from_to(to);
     if patch {
-        Ok(Response::DiffPatch { files: repo.diff_patch(from, to)?, to_kind })
+        Ok(Response::DiffPatch {
+            files: repo.diff_patch(from, to)?,
+            to_kind,
+        })
     } else if stat {
-        let files: Vec<FileStat> =
-            repo.diff_patch(from, to)?.iter().map(FileStat::from_patch).collect();
+        let files: Vec<FileStat> = repo
+            .diff_patch(from, to)?
+            .iter()
+            .map(FileStat::from_patch)
+            .collect();
         let total_added = files.iter().map(|f| f.added_lines).sum();
         let total_removed = files.iter().map(|f| f.removed_lines).sum();
-        Ok(Response::DiffStat { files, total_added, total_removed, to_kind })
+        Ok(Response::DiffStat {
+            files,
+            total_added,
+            total_removed,
+            to_kind,
+        })
     } else {
         let diff = repo.diff(from, to)?;
-        Ok(Response::Diff { data: DiffData::from_tree_diff(&diff), to_kind })
+        Ok(Response::Diff {
+            data: DiffData::from_tree_diff(&diff),
+            to_kind,
+        })
     }
 }
 
@@ -787,8 +1034,10 @@ fn run_diff(
 /// claims held by *other* actors (computed against the pre-claim state).
 fn run_claim(repo: &Repository, path: &str, holder: &str, note: &str) -> Result<Response> {
     let existing = repo.claims()?;
-    let conflicts: Vec<Claim> =
-        crate::claims::conflicts(&existing, path, holder).into_iter().cloned().collect();
+    let conflicts: Vec<Claim> = crate::claims::conflicts(&existing, path, holder)
+        .into_iter()
+        .cloned()
+        .collect();
     let op = repo.claim(path, holder, note)?;
     // Recover the just-recorded claim (normalised path / trimmed holder).
     let norm_path = crate::tree::normalize_repo_path(path);
@@ -798,7 +1047,67 @@ fn run_claim(repo: &Repository, path: &str, holder: &str, note: &str) -> Result<
         .into_iter()
         .find(|c| c.path == norm_path && c.holder == trimmed_holder)
         .ok_or_else(|| crate::Error::Corruption("claim was not recorded".to_string()))?;
-    Ok(Response::Claimed { claim, conflicts, op: op.to_string(), op_short: op.short() })
+    Ok(Response::Claimed {
+        claim,
+        conflicts,
+        op: op.to_string(),
+        op_short: op.short(),
+    })
+}
+
+fn run_backport(
+    repo: &Repository,
+    source: ObjectId,
+    target_lane: &str,
+    message: Option<String>,
+    reason: &str,
+    author: Identity,
+    admit: bool,
+) -> Result<Response> {
+    let outcome = repo.backport(source, target_lane, message, reason, author)?;
+    let admission = admit_result(repo, &outcome, admit, reason)?;
+    Ok(Response::Backport {
+        data: backport_data(&outcome, admission.as_ref()),
+    })
+}
+
+fn run_backport_continue(repo: &Repository, author: Identity, admit: bool) -> Result<Response> {
+    let outcome = repo.continue_backport(author)?;
+    let reason = match &outcome {
+        BackportOutcome::Created(record) | BackportOutcome::AlreadyPorted(record) => {
+            record.provenance().reason()
+        }
+        BackportOutcome::Settlement(settlement) => settlement.provenance().reason(),
+    };
+    let admission = admit_result(repo, &outcome, admit, reason)?;
+    Ok(Response::Backport {
+        data: backport_data(&outcome, admission.as_ref()),
+    })
+}
+
+fn admit_result(
+    repo: &Repository,
+    outcome: &BackportOutcome,
+    admit: bool,
+    reason: &str,
+) -> Result<Option<AdmissionData>> {
+    if !admit {
+        return Ok(None);
+    }
+    let Some(cut) = outcome.result_cut() else {
+        return Ok(None);
+    };
+    if matches!(outcome, BackportOutcome::AlreadyPorted(_)) {
+        return Ok(None);
+    }
+    let lane = match outcome {
+        BackportOutcome::Created(record) | BackportOutcome::AlreadyPorted(record) => {
+            record.target_lane()
+        }
+        BackportOutcome::Settlement(settlement) => settlement.provenance().target_lane(),
+    };
+    let outcome = repo.admit(cut, lane, reason)?;
+    Ok(Some(admission_data(&outcome)))
 }
 
 /// Assembles the [`CurrentData`] orientation payload from the repository.
@@ -808,7 +1117,11 @@ fn current_data(repo: &Repository) -> Result<CurrentData> {
     let wc = repo.working_copy()?;
     // The current state "came from a restore" iff the head op's command is a
     // restore (an undo of a restore resets this, which is the intended meaning).
-    let from_restore = op.metadata().command().get(1).is_some_and(|verb| verb == "restore");
+    let from_restore = op
+        .metadata()
+        .command()
+        .get(1)
+        .is_some_and(|verb| verb == "restore");
     let base_cut = repo.base_cut()?.as_ref().map(CutSummary::from_snapshot);
     let clean = repo.status()?.is_clean();
     Ok(CurrentData {
@@ -881,6 +1194,95 @@ fn scoped_cut_data(outcome: &crate::repo::ScopedCutOutcome) -> ScopedCutData {
     }
 }
 
+fn lane_data(lane: &Lane) -> LaneData {
+    LaneData {
+        name: lane.name().to_owned(),
+        cut: lane.cut().to_string(),
+        cut_short: lane.cut().short(),
+        admission: lane.admission().to_string(),
+        admission_short: lane.admission().short(),
+        reason: lane.reason().to_owned(),
+        timestamp: lane.timestamp(),
+    }
+}
+
+fn admission_data(outcome: &AdmissionOutcome) -> AdmissionData {
+    AdmissionData {
+        lane: outcome.lane().to_owned(),
+        cut: outcome.cut().to_string(),
+        cut_short: outcome.cut().short(),
+        op: outcome.op().to_string(),
+        op_short: outcome.op().short(),
+        reason: outcome.reason().to_owned(),
+    }
+}
+
+fn provenance_data(provenance: &BackportProvenance) -> BackportProvenanceData {
+    let source_admission = provenance
+        .source_admission()
+        .map(|source| SourceAdmissionData {
+            lane: source.lane().to_owned(),
+            op: source.op().to_string(),
+            op_short: source.op().short(),
+        });
+    BackportProvenanceData {
+        source_cut: provenance.source_cut().to_string(),
+        source_cut_short: provenance.source_cut().short(),
+        source_change_id: provenance.source_change_id().to_string(),
+        source_change_id_short: provenance.source_change_id().short(),
+        source_admission,
+        target_lane: provenance.target_lane().to_owned(),
+        target_base: provenance.target_base().to_string(),
+        target_base_short: provenance.target_base().short(),
+        reason: provenance.reason().to_owned(),
+    }
+}
+
+fn record_backport_data(
+    outcome: &str,
+    record: &BackportRecord,
+    admission: Option<&AdmissionData>,
+) -> BackportData {
+    BackportData {
+        outcome: outcome.to_owned(),
+        provenance: provenance_data(record.provenance()),
+        cut: Some(record.result_cut().to_string()),
+        cut_short: Some(record.result_cut().short()),
+        op: Some(record.op().to_string()),
+        op_short: Some(record.op().short()),
+        method: record.method().to_owned(),
+        conflicts: Vec::new(),
+        admission: admission.cloned(),
+    }
+}
+
+fn settlement_backport_data(
+    settlement: &BackportSettlement,
+    admission: Option<&AdmissionData>,
+) -> BackportData {
+    BackportData {
+        outcome: "settlement".to_owned(),
+        provenance: provenance_data(settlement.provenance()),
+        cut: None,
+        cut_short: None,
+        op: Some(settlement.op().to_string()),
+        op_short: Some(settlement.op().short()),
+        method: "settlement".to_owned(),
+        conflicts: settlement.conflicts().to_vec(),
+        admission: admission.cloned(),
+    }
+}
+
+fn backport_data(outcome: &BackportOutcome, admission: Option<&AdmissionData>) -> BackportData {
+    match outcome {
+        BackportOutcome::Created(record) => record_backport_data("created", record, admission),
+        BackportOutcome::AlreadyPorted(record) => {
+            record_backport_data("already_ported", record, admission)
+        }
+        BackportOutcome::Settlement(settlement) => settlement_backport_data(settlement, admission),
+    }
+}
+
 /// Returns the agent-API schema (the same data the `help` method returns).
 ///
 /// Exposed so a client (e.g. the `tack schema` CLI command) can render the API
@@ -896,62 +1298,260 @@ pub fn schema_methods() -> Vec<MethodInfo> {
 /// One [`MethodInfo`] per [`Request`] variant. The
 /// `help_describes_every_dispatched_method` test keeps this in lock-step with
 /// the dispatch in [`run`] so a new method cannot ship undocumented.
+#[expect(
+    clippy::too_many_lines,
+    reason = "hand-maintained API schema is intentionally kept as one table"
+)]
 fn api_schema() -> Vec<MethodInfo> {
     /// Shorthand for a parameter descriptor.
     fn p(name: &str, ty: &str, required: bool, description: &str) -> ParamInfo {
-        ParamInfo { name: name.to_string(), ty: ty.to_string(), required, description: description.to_string() }
+        ParamInfo {
+            name: name.to_string(),
+            ty: ty.to_string(),
+            required,
+            description: description.to_string(),
+        }
     }
     /// Shorthand for a method descriptor.
     fn m(method: &str, summary: &str, params: Vec<ParamInfo>, returns: &str) -> MethodInfo {
-        MethodInfo { method: method.to_string(), summary: summary.to_string(), params, returns: returns.to_string() }
+        MethodInfo {
+            method: method.to_string(),
+            summary: summary.to_string(),
+            params,
+            returns: returns.to_string(),
+        }
     }
 
     vec![
-        m("status", "Working directory vs the working-copy snapshot.", vec![], "{status:\"status\", data:{added,modified,deleted,clean}}"),
-        m("snapshot", "Auto-snapshot the working copy.", vec![], "{status:\"snapshot\", snapshot, snapshot_short}"),
-        m("named_cut", "Close a named cut (the analog of a commit).", vec![
-            p("message", "string", true, "the cut message"),
-            p("author_name", "string", true, "author display name"),
-            p("author_email", "string", true, "author e-mail (never echoed back)"),
-        ], "{status:\"named_cut\", cut, cut_short}"),
-        m("log", "Named cuts in the working copy's ancestry, newest-first.", vec![], "{status:\"log\", cuts:[CutSummary]}"),
-        m("op_log", "The operation log, newest-first.", vec![], "{status:\"op_log\", ops:[OpSummary]}"),
-        m("diff", "Diff the live working copy (or two snapshots); file-level, or per-file stat/patch.", vec![
-            p("from", "string?", false, "from id/prefix (default: the to-snapshot's parent cut)"),
-            p("to", "string?", false, "to id/prefix (default: the LIVE working copy — current files on disk, including dirty edits, the same on-disk bytes `status` reads; pass a snapshot id to diff a recorded snapshot instead). Accepts a snapshot OR an op id."),
-            p("stat", "bool", false, "per-file line counts (DiffStat)"),
-            p("patch", "bool", false, "per-file content hunks (DiffPatch); wins over stat"),
-        ], "{status:\"diff\"|\"diff_stat\"|\"diff_patch\", to_kind:\"live_working_copy\"|\"snapshot\", ...}"),
-        m("restore", "Non-destructively restore the working copy to an op/snapshot.", vec![
-            p("target", "string", true, "op or snapshot id/prefix to restore to"),
-        ], "{status:\"restored\", op, working_copy, restored_cut, previous_op, hint}"),
-        m("undo", "Reverse the most recent operation (non-destructive).", vec![], "{status:\"undone\", op, undone_op, working_copy}"),
-        m("cat", "An object's type tag and byte length.", vec![
-            p("id", "string", true, "object id/prefix"),
-        ], "{status:\"cat\", object:{id,id_short,kind,size}}"),
-        m("ls", "Immediate entries of a tree (default: the LIVE working copy on disk).", vec![
-            p("tree", "string?", false, "tree id/prefix (default: the live working copy — current files on disk, including un-snapshotted adds/removes)"),
-        ], "{status:\"ls\", entries:[TreeEntryData]}"),
-        m("help", "This self-description of every method.", vec![], "{status:\"help\", methods:[MethodInfo]}"),
-        m("current", "Where the working copy is: op, base cut, heads, from_restore.", vec![], "{status:\"current\", data:CurrentData}"),
-        m("cuts", "Every named cut across all lineages, newest-first.", vec![], "{status:\"cuts\", cuts:[CutSummary]}"),
-        m("claims", "The currently-held advisory claims.", vec![], "{status:\"claims\", claims:[Claim]}"),
-        m("claim", "Record an advisory claim on a path (never enforced).", vec![
-            p("path", "string", true, "repo-relative path to claim"),
-            p("holder", "string", true, "actor id/username (never an e-mail)"),
-            p("note", "string", false, "optional advisory note"),
-        ], "{status:\"claimed\", claim, conflicts, op}"),
-        m("release", "Release an advisory claim on a path.", vec![
-            p("path", "string", true, "repo-relative path to release"),
-            p("holder", "string", true, "actor releasing the claim"),
-        ], "{status:\"claims\", claims:[Claim]}"),
-        m("scoped_cut", "A named cut capturing only the given paths from disk.", vec![
-            p("paths", "[string]", true, "repo-relative path selectors to capture"),
-            p("message", "string", true, "the cut message"),
-            p("author_name", "string", true, "author display name"),
-            p("author_email", "string", true, "author e-mail (never echoed back)"),
-            p("base", "string?", false, "base cut/op to overlay onto (default: current base cut)"),
-        ], "{status:\"scoped_cut\", data:ScopedCutData}"),
+        m(
+            "status",
+            "Working directory vs the working-copy snapshot.",
+            vec![],
+            "{status:\"status\", data:{added,modified,deleted,clean}}",
+        ),
+        m(
+            "snapshot",
+            "Auto-snapshot the working copy.",
+            vec![],
+            "{status:\"snapshot\", snapshot, snapshot_short}",
+        ),
+        m(
+            "named_cut",
+            "Close a named cut (the analog of a commit).",
+            vec![
+                p("message", "string", true, "the cut message"),
+                p("author_name", "string", true, "author display name"),
+                p(
+                    "author_email",
+                    "string",
+                    true,
+                    "author e-mail (never echoed back)",
+                ),
+            ],
+            "{status:\"named_cut\", cut, cut_short}",
+        ),
+        m(
+            "log",
+            "Named cuts in the working copy's ancestry, newest-first.",
+            vec![],
+            "{status:\"log\", cuts:[CutSummary]}",
+        ),
+        m(
+            "op_log",
+            "The operation log, newest-first.",
+            vec![],
+            "{status:\"op_log\", ops:[OpSummary]}",
+        ),
+        m(
+            "diff",
+            "Diff the live working copy (or two snapshots); file-level, or per-file stat/patch.",
+            vec![
+                p(
+                    "from",
+                    "string?",
+                    false,
+                    "from id/prefix (default: the to-snapshot's parent cut)",
+                ),
+                p(
+                    "to",
+                    "string?",
+                    false,
+                    "to id/prefix (default: the LIVE working copy — current files on disk, including dirty edits, the same on-disk bytes `status` reads; pass a snapshot id to diff a recorded snapshot instead). Accepts a snapshot OR an op id.",
+                ),
+                p("stat", "bool", false, "per-file line counts (DiffStat)"),
+                p(
+                    "patch",
+                    "bool",
+                    false,
+                    "per-file content hunks (DiffPatch); wins over stat",
+                ),
+            ],
+            "{status:\"diff\"|\"diff_stat\"|\"diff_patch\", to_kind:\"live_working_copy\"|\"snapshot\", ...}",
+        ),
+        m(
+            "restore",
+            "Non-destructively restore the working copy to an op/snapshot.",
+            vec![p(
+                "target",
+                "string",
+                true,
+                "op or snapshot id/prefix to restore to",
+            )],
+            "{status:\"restored\", op, working_copy, restored_cut, previous_op, hint}",
+        ),
+        m(
+            "undo",
+            "Reverse the most recent operation (non-destructive).",
+            vec![],
+            "{status:\"undone\", op, undone_op, working_copy}",
+        ),
+        m(
+            "cat",
+            "An object's type tag and byte length.",
+            vec![p("id", "string", true, "object id/prefix")],
+            "{status:\"cat\", object:{id,id_short,kind,size}}",
+        ),
+        m(
+            "ls",
+            "Immediate entries of a tree (default: the LIVE working copy on disk).",
+            vec![p(
+                "tree",
+                "string?",
+                false,
+                "tree id/prefix (default: the live working copy — current files on disk, including un-snapshotted adds/removes)",
+            )],
+            "{status:\"ls\", entries:[TreeEntryData]}",
+        ),
+        m(
+            "help",
+            "This self-description of every method.",
+            vec![],
+            "{status:\"help\", methods:[MethodInfo]}",
+        ),
+        m(
+            "current",
+            "Where the working copy is: op, base cut, heads, from_restore.",
+            vec![],
+            "{status:\"current\", data:CurrentData}",
+        ),
+        m(
+            "cuts",
+            "Every named cut across all lineages, newest-first.",
+            vec![],
+            "{status:\"cuts\", cuts:[CutSummary]}",
+        ),
+        m(
+            "claims",
+            "The currently-held advisory claims.",
+            vec![],
+            "{status:\"claims\", claims:[Claim]}",
+        ),
+        m(
+            "claim",
+            "Record an advisory claim on a path (never enforced).",
+            vec![
+                p("path", "string", true, "repo-relative path to claim"),
+                p(
+                    "holder",
+                    "string",
+                    true,
+                    "actor id/username (never an e-mail)",
+                ),
+                p("note", "string", false, "optional advisory note"),
+            ],
+            "{status:\"claimed\", claim, conflicts, op}",
+        ),
+        m(
+            "release",
+            "Release an advisory claim on a path.",
+            vec![
+                p("path", "string", true, "repo-relative path to release"),
+                p("holder", "string", true, "actor releasing the claim"),
+            ],
+            "{status:\"claims\", claims:[Claim]}",
+        ),
+        m(
+            "scoped_cut",
+            "A named cut capturing only the given paths from disk.",
+            vec![
+                p(
+                    "paths",
+                    "[string]",
+                    true,
+                    "repo-relative path selectors to capture",
+                ),
+                p("message", "string", true, "the cut message"),
+                p("author_name", "string", true, "author display name"),
+                p(
+                    "author_email",
+                    "string",
+                    true,
+                    "author e-mail (never echoed back)",
+                ),
+                p(
+                    "base",
+                    "string?",
+                    false,
+                    "base cut/op to overlay onto (default: current base cut)",
+                ),
+            ],
+            "{status:\"scoped_cut\", data:ScopedCutData}",
+        ),
+        m(
+            "lanes",
+            "Current op-derived team/release lanes.",
+            vec![],
+            "{status:\"lanes\", lanes:[LaneData]}",
+        ),
+        m(
+            "admit",
+            "Admit a cut to a team/release lane.",
+            vec![
+                p("cut", "string", true, "cut id/prefix to admit"),
+                p("lane", "string", true, "target lane name"),
+                p("reason", "string", false, "admission reason"),
+            ],
+            "{status:\"admitted\", data:AdmissionData}",
+        ),
+        m(
+            "backport",
+            "Create a target-lane backport proposal from a source cut.",
+            vec![
+                p("source", "string", true, "source fix cut id/prefix"),
+                p("target_lane", "string", true, "target lane name"),
+                p("message", "string?", false, "target cut message"),
+                p("reason", "string", false, "backport reason"),
+                p("author_name", "string", true, "author display name"),
+                p(
+                    "author_email",
+                    "string",
+                    true,
+                    "author e-mail (never echoed back)",
+                ),
+                p(
+                    "admit",
+                    "bool",
+                    false,
+                    "also admit the resulting cut when one is created",
+                ),
+            ],
+            "{status:\"backport\", data:BackportData}",
+        ),
+        m(
+            "backport_continue",
+            "Finish the current manual backport settlement.",
+            vec![
+                p("author_name", "string", true, "author display name"),
+                p(
+                    "author_email",
+                    "string",
+                    true,
+                    "author e-mail (never echoed back)",
+                ),
+                p("admit", "bool", false, "also admit the resulting cut"),
+            ],
+            "{status:\"backport\", data:BackportData}",
+        ),
     ]
 }
 
@@ -990,10 +1590,19 @@ mod tests {
             },
             Request::Log,
             Request::OpLog,
-            Request::Diff { from: Some("ab12".to_owned()), to: None, stat: false, patch: true },
-            Request::Restore { target: "deadbeef".to_owned() },
+            Request::Diff {
+                from: Some("ab12".to_owned()),
+                to: None,
+                stat: false,
+                patch: true,
+            },
+            Request::Restore {
+                target: "deadbeef".to_owned(),
+            },
             Request::Undo,
-            Request::Cat { id: "cafe".to_owned() },
+            Request::Cat {
+                id: "cafe".to_owned(),
+            },
             Request::Ls { tree: None },
             Request::Help,
             Request::Current,
@@ -1004,13 +1613,36 @@ mod tests {
                 holder: "alice".to_owned(),
                 note: "wip".to_owned(),
             },
-            Request::Release { path: "src/x.rs".to_owned(), holder: "alice".to_owned() },
+            Request::Release {
+                path: "src/x.rs".to_owned(),
+                holder: "alice".to_owned(),
+            },
             Request::ScopedCut {
                 paths: vec!["src".to_owned()],
                 message: "scoped".to_owned(),
                 author_name: "Alice".to_owned(),
                 author_email: "alice@example.com".to_owned(),
                 base: None,
+            },
+            Request::Lanes,
+            Request::Admit {
+                cut: "ab12".to_owned(),
+                lane: "team/main".to_owned(),
+                reason: "seed".to_owned(),
+            },
+            Request::Backport {
+                source: "cd34".to_owned(),
+                target_lane: "release/7.8.0".to_owned(),
+                message: Some("hotfix".to_owned()),
+                reason: "customer-blocker".to_owned(),
+                author_name: "Alice".to_owned(),
+                author_email: "alice@example.com".to_owned(),
+                admit: true,
+            },
+            Request::BackportContinue {
+                author_name: "Alice".to_owned(),
+                author_email: "alice@example.com".to_owned(),
+                admit: true,
             },
         ];
         for req in requests {
@@ -1024,13 +1656,29 @@ mod tests {
     fn request_uses_method_tag() {
         let json = serde_json::to_string(&Request::Status).expect("serialize");
         assert_eq!(json, r#"{"method":"status"}"#);
-        let json = serde_json::to_string(&Request::Diff { from: None, to: None, stat: false, patch: false })
-            .expect("serialize");
-        assert_eq!(json, r#"{"method":"diff","from":null,"to":null,"stat":false,"patch":false}"#);
+        let json = serde_json::to_string(&Request::Diff {
+            from: None,
+            to: None,
+            stat: false,
+            patch: false,
+        })
+        .expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"method":"diff","from":null,"to":null,"stat":false,"patch":false}"#
+        );
         // The stat/patch flags default, so the legacy two-field form still parses.
         let legacy: Request = serde_json::from_str(r#"{"method":"diff","from":null,"to":null}"#)
             .expect("legacy diff request must still parse");
-        assert_eq!(legacy, Request::Diff { from: None, to: None, stat: false, patch: false });
+        assert_eq!(
+            legacy,
+            Request::Diff {
+                from: None,
+                to: None,
+                stat: false,
+                patch: false
+            }
+        );
     }
 
     #[test]
@@ -1044,8 +1692,14 @@ mod tests {
                     clean: false,
                 },
             },
-            Response::Snapshot { snapshot: "ab".repeat(32), snapshot_short: "abababababab".to_owned() },
-            Response::NamedCut { cut: "cd".repeat(32), cut_short: "cdcdcdcdcdcd".to_owned() },
+            Response::Snapshot {
+                snapshot: "ab".repeat(32),
+                snapshot_short: "abababababab".to_owned(),
+            },
+            Response::NamedCut {
+                cut: "cd".repeat(32),
+                cut_short: "cdcdcdcdcdcd".to_owned(),
+            },
             Response::Log {
                 cuts: vec![CutSummary {
                     id: "ef".repeat(32),
@@ -1059,7 +1713,9 @@ mod tests {
                 }],
             },
             Response::Ok,
-            Response::Error { message: "boom".to_owned() },
+            Response::Error {
+                message: "boom".to_owned(),
+            },
         ];
         for resp in responses {
             let json = serde_json::to_string(&resp).expect("serialize");
@@ -1083,7 +1739,10 @@ mod tests {
             }],
         };
         let json = serde_json::to_string(&resp).expect("serialize");
-        assert!(json.contains(r#""status":"log""#), "expected status tag: {json}");
+        assert!(
+            json.contains(r#""status":"log""#),
+            "expected status tag: {json}"
+        );
         assert!(json.contains("Alice"), "author name should be present");
         assert!(
             !json.contains('@'),
@@ -1144,8 +1803,16 @@ mod tests {
         let dir = TempDir::new().expect("temp");
         let repo = Repository::init(dir.path()).expect("init");
         // A non-hex prefix is rejected by resolve_prefix → Error response.
-        let resp = handle(&repo, Request::Cat { id: "zz".to_owned() });
-        assert!(matches!(resp, Response::Error { .. }), "expected Error, got {resp:?}");
+        let resp = handle(
+            &repo,
+            Request::Cat {
+                id: "zz".to_owned(),
+            },
+        );
+        assert!(
+            matches!(resp, Response::Error { .. }),
+            "expected Error, got {resp:?}"
+        );
     }
 
     #[test]
@@ -1180,7 +1847,10 @@ mod tests {
             panic!("expected Ls response");
         };
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"b.txt"), "ls must list the un-snapshotted file, got {names:?}");
+        assert!(
+            names.contains(&"b.txt"),
+            "ls must list the un-snapshotted file, got {names:?}"
+        );
     }
 
     // ── serve() over an in-memory Cursor ─────────────────────────────────────────
@@ -1204,19 +1874,32 @@ mod tests {
 
         let text = String::from_utf8(output).expect("utf8 output");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "expected one response line per request line");
+        assert_eq!(
+            lines.len(),
+            3,
+            "expected one response line per request line"
+        );
 
         // Line 1: a successful Snapshot.
         let r1: Response = serde_json::from_str(lines[0]).expect("parse line 1");
-        assert!(matches!(r1, Response::Snapshot { .. }), "line 1 should be Snapshot: {r1:?}");
+        assert!(
+            matches!(r1, Response::Snapshot { .. }),
+            "line 1 should be Snapshot: {r1:?}"
+        );
 
         // Line 2: the malformed line yields an Error, NOT a crash or skipped line.
         let r2: Response = serde_json::from_str(lines[1]).expect("parse line 2");
-        assert!(matches!(r2, Response::Error { .. }), "line 2 should be Error: {r2:?}");
+        assert!(
+            matches!(r2, Response::Error { .. }),
+            "line 2 should be Error: {r2:?}"
+        );
 
         // Line 3: the loop kept going and answered the next request.
         let r3: Response = serde_json::from_str(lines[2]).expect("parse line 3");
-        assert!(matches!(r3, Response::Status { .. }), "line 3 should be Status: {r3:?}");
+        assert!(
+            matches!(r3, Response::Status { .. }),
+            "line 3 should be Status: {r3:?}"
+        );
     }
 
     #[test]
@@ -1227,18 +1910,24 @@ mod tests {
         let reader = Cursor::new(Vec::new());
         let mut output: Vec<u8> = Vec::new();
         serve(&repo, reader, &mut output).expect("serve loop");
-        assert!(output.is_empty(), "EOF before any request must produce no output");
+        assert!(
+            output.is_empty(),
+            "EOF before any request must produce no output"
+        );
     }
 
     // ── new methods: help / current / cuts / claims / scoped_cut / diffs ─────────
 
     /// A named-cut request with a pinned author, returning the closed cut id.
     fn cut(repo: &Repository, message: &str) -> String {
-        match handle(repo, Request::NamedCut {
-            message: message.to_owned(),
-            author_name: "Alice".to_owned(),
-            author_email: "alice@example.com".to_owned(),
-        }) {
+        match handle(
+            repo,
+            Request::NamedCut {
+                message: message.to_owned(),
+                author_name: "Alice".to_owned(),
+                author_email: "alice@example.com".to_owned(),
+            },
+        ) {
             Response::NamedCut { cut, .. } => cut,
             other => panic!("expected NamedCut, got {other:?}"),
         }
@@ -1254,15 +1943,44 @@ mod tests {
         let names: std::collections::HashSet<&str> =
             methods.iter().map(|m| m.method.as_str()).collect();
         for expected in [
-            "status", "snapshot", "named_cut", "log", "op_log", "diff", "restore", "undo",
-            "cat", "ls", "help", "current", "cuts", "claims", "claim", "release", "scoped_cut",
+            "status",
+            "snapshot",
+            "named_cut",
+            "log",
+            "op_log",
+            "diff",
+            "restore",
+            "undo",
+            "cat",
+            "ls",
+            "help",
+            "current",
+            "cuts",
+            "claims",
+            "claim",
+            "release",
+            "scoped_cut",
+            "lanes",
+            "admit",
+            "backport",
+            "backport_continue",
         ] {
-            assert!(names.contains(expected), "help is missing method {expected}");
+            assert!(
+                names.contains(expected),
+                "help is missing method {expected}"
+            );
         }
-        assert_eq!(names.len(), 17, "help must describe exactly the dispatched methods");
+        assert_eq!(
+            names.len(),
+            21,
+            "help must describe exactly the dispatched methods"
+        );
         // Self-description must not leak any PII either.
         let json = serde_json::to_string(&Response::Help { methods }).expect("serialize");
-        assert!(!json.contains('@'), "help payload must not contain an e-mail: {json}");
+        assert!(
+            !json.contains('@'),
+            "help payload must not contain an e-mail: {json}"
+        );
     }
 
     #[test]
@@ -1277,7 +1995,10 @@ mod tests {
         };
         assert!(!data.from_restore, "fresh state is not a restore");
         assert!(data.clean, "after a cut the working copy is clean");
-        assert_eq!(data.base_cut.as_ref().map(|c| c.id.clone()), Some(cut1.clone()));
+        assert_eq!(
+            data.base_cut.as_ref().map(|c| c.id.clone()),
+            Some(cut1.clone())
+        );
 
         write_file(dir.path(), "b.txt", b"two");
         let _ = cut(&repo, "c2");
@@ -1285,9 +2006,15 @@ mod tests {
         let Response::Current { data } = handle(&repo, Request::Current) else {
             panic!("expected Current");
         };
-        assert!(data.from_restore, "after a restore from_restore must be true");
+        assert!(
+            data.from_restore,
+            "after a restore from_restore must be true"
+        );
         let json = serde_json::to_string(&Response::Current { data }).expect("serialize");
-        assert!(!json.contains('@'), "current payload must not carry an e-mail: {json}");
+        assert!(
+            !json.contains('@'),
+            "current payload must not carry an e-mail: {json}"
+        );
     }
 
     #[test]
@@ -1304,11 +2031,19 @@ mod tests {
             panic!("expected Cuts");
         };
         let msgs: Vec<&str> = cuts.iter().map(|c| c.message.as_str()).collect();
-        assert!(msgs.contains(&"c1") && msgs.contains(&"c2"), "cuts must show both lineages: {msgs:?}");
+        assert!(
+            msgs.contains(&"c1") && msgs.contains(&"c2"),
+            "cuts must show both lineages: {msgs:?}"
+        );
 
-        let Response::Log { cuts } = handle(&repo, Request::Log) else { panic!("expected Log"); };
+        let Response::Log { cuts } = handle(&repo, Request::Log) else {
+            panic!("expected Log");
+        };
         let log_msgs: Vec<&str> = cuts.iter().map(|c| c.message.as_str()).collect();
-        assert!(!log_msgs.contains(&"c2"), "log follows the restored lineage: {log_msgs:?}");
+        assert!(
+            !log_msgs.contains(&"c2"),
+            "log follows the restored lineage: {log_msgs:?}"
+        );
     }
 
     #[test]
@@ -1320,20 +2055,44 @@ mod tests {
         write_file(dir.path(), "a.txt", b"l1\nCHANGED\n");
         let _ = handle(&repo, Request::Snapshot);
 
-        let Response::DiffPatch { files, to_kind } =
-            handle(&repo, Request::Diff { from: None, to: None, stat: false, patch: true })
-        else {
+        let Response::DiffPatch { files, to_kind } = handle(
+            &repo,
+            Request::Diff {
+                from: None,
+                to: None,
+                stat: false,
+                patch: true,
+            },
+        ) else {
             panic!("expected DiffPatch");
         };
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.txt");
-        assert!(files[0].added_lines >= 1 && files[0].removed_lines >= 1, "{files:?}");
-        assert!(!files[0].hunks.is_empty(), "a text change must produce hunks");
+        assert!(
+            files[0].added_lines >= 1 && files[0].removed_lines >= 1,
+            "{files:?}"
+        );
+        assert!(
+            !files[0].hunks.is_empty(),
+            "a text change must produce hunks"
+        );
         // Default `to` → the live working copy, reported for self-explanatory logs.
         assert_eq!(to_kind, DiffTarget::LiveWorkingCopy);
 
-        let Response::DiffStat { files, total_added, total_removed, to_kind } =
-            handle(&repo, Request::Diff { from: None, to: None, stat: true, patch: false })
+        let Response::DiffStat {
+            files,
+            total_added,
+            total_removed,
+            to_kind,
+        } = handle(
+            &repo,
+            Request::Diff {
+                from: None,
+                to: None,
+                stat: true,
+                patch: false,
+            },
+        )
         else {
             panic!("expected DiffStat");
         };
@@ -1342,8 +2101,19 @@ mod tests {
         assert_eq!(to_kind, DiffTarget::LiveWorkingCopy);
 
         // Default (no flags) must remain the file-level summary (back-compat).
-        let resp = handle(&repo, Request::Diff { from: None, to: None, stat: false, patch: false });
-        assert!(matches!(resp, Response::Diff { .. }), "default diff must stay file-level: {resp:?}");
+        let resp = handle(
+            &repo,
+            Request::Diff {
+                from: None,
+                to: None,
+                stat: false,
+                patch: false,
+            },
+        );
+        assert!(
+            matches!(resp, Response::Diff { .. }),
+            "default diff must stay file-level: {resp:?}"
+        );
     }
 
     /// An explicit `to` snapshot id classifies the diff as `to_kind: "snapshot"`,
@@ -1356,13 +2126,18 @@ mod tests {
         let cut = cut(&repo, "base");
 
         // Explicit `to` = a recorded snapshot/cut id → "snapshot".
-        let resp = handle(&repo, Request::Diff {
-            from: None,
-            to: Some(cut),
-            stat: false,
-            patch: false,
-        });
-        let Response::Diff { to_kind, .. } = resp else { panic!("expected Diff: {resp:?}") };
+        let resp = handle(
+            &repo,
+            Request::Diff {
+                from: None,
+                to: Some(cut),
+                stat: false,
+                patch: false,
+            },
+        );
+        let Response::Diff { to_kind, .. } = resp else {
+            panic!("expected Diff: {resp:?}")
+        };
         assert_eq!(to_kind, DiffTarget::Snapshot);
 
         // The wire strings match the documented values.
@@ -1370,7 +2145,10 @@ mod tests {
             serde_json::to_string(&DiffTarget::LiveWorkingCopy).unwrap(),
             "\"live_working_copy\""
         );
-        assert_eq!(serde_json::to_string(&DiffTarget::Snapshot).unwrap(), "\"snapshot\"");
+        assert_eq!(
+            serde_json::to_string(&DiffTarget::Snapshot).unwrap(),
+            "\"snapshot\""
+        );
     }
 
     #[test]
@@ -1378,11 +2156,17 @@ mod tests {
         let dir = TempDir::new().expect("temp");
         let repo = Repository::init(dir.path()).expect("init");
 
-        let Response::Claimed { claim, conflicts, .. } = handle(&repo, Request::Claim {
-            path: "src/x.rs".to_owned(),
-            holder: "alice".to_owned(),
-            note: "wip".to_owned(),
-        }) else {
+        let Response::Claimed {
+            claim, conflicts, ..
+        } = handle(
+            &repo,
+            Request::Claim {
+                path: "src/x.rs".to_owned(),
+                holder: "alice".to_owned(),
+                note: "wip".to_owned(),
+            },
+        )
+        else {
             panic!("expected Claimed");
         };
         assert_eq!(claim.path, "src/x.rs");
@@ -1390,19 +2174,26 @@ mod tests {
         assert!(conflicts.is_empty(), "no prior claim → no conflict");
 
         // A different holder on the same path is an advisory conflict.
-        let Response::Claimed { conflicts, .. } = handle(&repo, Request::Claim {
-            path: "src/x.rs".to_owned(),
-            holder: "bob".to_owned(),
-            note: String::new(),
-        }) else {
+        let Response::Claimed { conflicts, .. } = handle(
+            &repo,
+            Request::Claim {
+                path: "src/x.rs".to_owned(),
+                holder: "bob".to_owned(),
+                note: String::new(),
+            },
+        ) else {
             panic!("expected Claimed");
         };
         assert_eq!(conflicts.len(), 1, "bob's claim overlaps alice's");
         assert_eq!(conflicts[0].holder, "alice");
 
-        let Response::Claims { claims } =
-            handle(&repo, Request::Release { path: "src/x.rs".to_owned(), holder: "alice".to_owned() })
-        else {
+        let Response::Claims { claims } = handle(
+            &repo,
+            Request::Release {
+                path: "src/x.rs".to_owned(),
+                holder: "alice".to_owned(),
+            },
+        ) else {
             panic!("expected Claims from release");
         };
         assert_eq!(claims.len(), 1, "alice released; bob remains");
@@ -1419,16 +2210,23 @@ mod tests {
         write_file(dir.path(), "src/m.txt", b"m2");
         write_file(dir.path(), "other/o.txt", b"o2");
 
-        let Response::ScopedCut { data } = handle(&repo, Request::ScopedCut {
-            paths: vec!["src".to_owned()],
-            message: "scoped".to_owned(),
-            author_name: "Alice".to_owned(),
-            author_email: "alice@example.com".to_owned(),
-            base: None,
-        }) else {
+        let Response::ScopedCut { data } = handle(
+            &repo,
+            Request::ScopedCut {
+                paths: vec!["src".to_owned()],
+                message: "scoped".to_owned(),
+                author_name: "Alice".to_owned(),
+                author_email: "alice@example.com".to_owned(),
+                base: None,
+            },
+        ) else {
             panic!("expected ScopedCut");
         };
-        assert!(data.captured.contains(&"src/m.txt".to_owned()), "captured: {:?}", data.captured);
+        assert!(
+            data.captured.contains(&"src/m.txt".to_owned()),
+            "captured: {:?}",
+            data.captured
+        );
         assert!(
             data.outside_changes.contains(&"other/o.txt".to_owned()),
             "outside_changes: {:?}",
@@ -1436,7 +2234,10 @@ mod tests {
         );
         assert_eq!(data.cut.len(), 64);
         let json = serde_json::to_string(&Response::ScopedCut { data }).expect("serialize");
-        assert!(!json.contains('@'), "scoped_cut payload must not carry an e-mail: {json}");
+        assert!(
+            !json.contains('@'),
+            "scoped_cut payload must not carry an e-mail: {json}"
+        );
     }
 
     #[test]
@@ -1448,8 +2249,17 @@ mod tests {
         write_file(dir.path(), "f.txt", b"v2");
         let _ = cut(&repo, "v2");
 
-        let Response::Restored { restored_cut, previous_op, op, .. } =
-            handle(&repo, Request::Restore { target: cut1.clone() })
+        let Response::Restored {
+            restored_cut,
+            previous_op,
+            op,
+            ..
+        } = handle(
+            &repo,
+            Request::Restore {
+                target: cut1.clone(),
+            },
+        )
         else {
             panic!("expected Restored");
         };

@@ -183,8 +183,14 @@ fn deny_message(subcommand: Option<&str>) -> &'static str {
             "Use `tack restore --to <id>` or `tack undo` (both non-destructive)."
         }
         Some("init") => "This is already a tack repo. Use `tack` commands, not git.",
-        Some("branch" | "merge" | "rebase") => {
-            "tack uses cuts + the op-log, not git branches. See `tack cuts` / `tack op log`."
+        Some("branch") => {
+            "tack derives lanes from admissions, not git branches. Use `tack lanes` and `tack admit <cut> --to <lane>`."
+        }
+        Some("merge" | "rebase") => {
+            "tack has no rebase or fast-forward flow. Use cuts, lane admission, and `tack backport` for release fixes."
+        }
+        Some("cherry-pick") => {
+            "Use `tack backport <source-cut> --to <lane>` to port a fix into a release lane."
         }
         Some("push" | "pull" | "fetch" | "clone" | "remote") => {
             "tack is local-only in v0 — there is no remote yet."
@@ -379,9 +385,10 @@ mod tests {
         assert!(deny_message(Some("reset")).contains("tack restore"));
         assert!(deny_message(Some("revert")).contains("tack restore"));
         assert!(deny_message(Some("init")).contains("already a tack repo"));
-        assert!(deny_message(Some("branch")).contains("tack cuts"));
-        assert!(deny_message(Some("merge")).contains("tack cuts"));
-        assert!(deny_message(Some("rebase")).contains("tack cuts"));
+        assert!(deny_message(Some("branch")).contains("tack lanes"));
+        assert!(deny_message(Some("merge")).contains("tack backport"));
+        assert!(deny_message(Some("rebase")).contains("fast-forward"));
+        assert!(deny_message(Some("cherry-pick")).contains("tack backport"));
         assert!(deny_message(Some("push")).contains("local-only"));
         assert!(deny_message(Some("pull")).contains("local-only"));
         assert!(deny_message(Some("fetch")).contains("local-only"));

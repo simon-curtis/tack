@@ -80,7 +80,10 @@ pub use tree::{
 pub use workcopy::{Status, materialize, status};
 
 pub use oplog::{append_op, current_op, op_head, op_log, set_op_head};
-pub use repo::{FORMAT_VERSION, Repository};
+pub use repo::{
+    AdmissionOutcome, BackportOutcome, BackportProvenance, BackportRecord, BackportSettlement,
+    FORMAT_VERSION, Lane, Repository, SourceAdmission,
+};
 
 pub use api::{Request, Response, handle, serve};
 
@@ -89,6 +92,6 @@ pub use watch::{DEFAULT_DEBOUNCE, Debouncer, WatchOptions, should_snapshot, watc
 // `mount` is always present (a typed-error stub off Windows / without the
 // feature); the real source type is only re-exported when the projection is
 // actually compiled.
-pub use projfs::mount;
 #[cfg(all(windows, feature = "projfs"))]
 pub use projfs::TackProjection;
+pub use projfs::mount;

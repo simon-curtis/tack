@@ -119,7 +119,11 @@ impl FileStat {
 /// Returns [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) /
 /// [`Error::Corruption`](crate::Error::Corruption) if a tree, sub-tree, or blob
 /// is missing or fails verification.
-pub fn tree_patch(store: &ObjectStore, from_tree: &ObjectId, to_tree: &ObjectId) -> Result<Vec<FilePatch>> {
+pub fn tree_patch(
+    store: &ObjectStore,
+    from_tree: &ObjectId,
+    to_tree: &ObjectId,
+) -> Result<Vec<FilePatch>> {
     let diff = diff_trees(store, from_tree, to_tree)?;
     let mut patches: Vec<FilePatch> = Vec::new();
 
@@ -306,14 +310,19 @@ mod tests {
     }
 
     fn patch_for<'a>(patches: &'a [FilePatch], path: &str) -> &'a FilePatch {
-        patches.iter().find(|p| p.path == path).unwrap_or_else(|| panic!("no patch for {path}"))
+        patches
+            .iter()
+            .find(|p| p.path == path)
+            .unwrap_or_else(|| panic!("no patch for {path}"))
     }
 
     #[test]
     fn modified_file_reports_inserts_and_deletes() -> Result<()> {
         let (_d, store) = temp_store();
         let from = tree_of(&store, |r| write_file(r, "a.txt", b"line1\nline2\nline3\n"));
-        let to = tree_of(&store, |r| write_file(r, "a.txt", b"line1\nCHANGED\nline3\n"));
+        let to = tree_of(&store, |r| {
+            write_file(r, "a.txt", b"line1\nCHANGED\nline3\n");
+        });
         let patches = tree_patch(&store, &from, &to)?;
         let p = patch_for(&patches, "a.txt");
         assert_eq!(p.change, "modified");
@@ -415,14 +424,30 @@ mod tests {
         // Added: the old side spans zero lines → old_start must be 0.
         let added = tree_patch(&store, &empty, &three)?;
         let h = &patch_for(&added, "f.txt").hunks[0];
-        assert_eq!((h.old_start, h.old_lines), (0, 0), "added file old side must be -0,0");
-        assert_eq!((h.new_start, h.new_lines), (1, 3), "added file new side must be +1,3");
+        assert_eq!(
+            (h.old_start, h.old_lines),
+            (0, 0),
+            "added file old side must be -0,0"
+        );
+        assert_eq!(
+            (h.new_start, h.new_lines),
+            (1, 3),
+            "added file new side must be +1,3"
+        );
 
         // Removed: the new side spans zero lines → new_start must be 0.
         let removed = tree_patch(&store, &three, &empty)?;
         let h = &patch_for(&removed, "f.txt").hunks[0];
-        assert_eq!((h.old_start, h.old_lines), (1, 3), "removed file old side must be -1,3");
-        assert_eq!((h.new_start, h.new_lines), (0, 0), "removed file new side must be +0,0");
+        assert_eq!(
+            (h.old_start, h.old_lines),
+            (1, 3),
+            "removed file old side must be -1,3"
+        );
+        assert_eq!(
+            (h.new_start, h.new_lines),
+            (0, 0),
+            "removed file new side must be +0,0"
+        );
         Ok(())
     }
 
@@ -441,7 +466,10 @@ mod tests {
         let to = tree_of(&store, |r| write_file(r, "big.txt", big.as_bytes()));
         let patches = tree_patch(&store, &from, &to)?;
         let p = patch_for(&patches, "big.txt");
-        assert!(p.binary, "a file over MAX_DIFF_BYTES must be reported binary");
+        assert!(
+            p.binary,
+            "a file over MAX_DIFF_BYTES must be reported binary"
+        );
         assert!(p.hunks.is_empty(), "oversize file must have no hunks");
         assert_eq!(p.added_lines, 0);
         Ok(())

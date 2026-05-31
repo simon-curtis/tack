@@ -27,7 +27,7 @@
 //! bookmarks, tags) is recovered by reading the op at the head; the repository
 //! holds no other mutable cursor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -178,7 +178,11 @@ impl Repository {
             vec!["tack".to_string(), "init".to_string()],
         )?;
 
-        Ok(Self { work_dir, tack_dir, store })
+        Ok(Self {
+            work_dir,
+            tack_dir,
+            store,
+        })
     }
 
     /// Opens an existing repository by discovering `.tack/` from `path` upward.
@@ -197,7 +201,10 @@ impl Repository {
         let work_dir = discover_root(start).ok_or_else(|| {
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("no tack repository found in {} or any parent", start.display()),
+                format!(
+                    "no tack repository found in {} or any parent",
+                    start.display()
+                ),
             ))
         })?;
         let tack_dir = work_dir.join(TACK_DIR);
@@ -211,7 +218,11 @@ impl Repository {
         }
 
         let store = ObjectStore::open(&tack_dir)?;
-        Ok(Self { work_dir, tack_dir, store })
+        Ok(Self {
+            work_dir,
+            tack_dir,
+            store,
+        })
     }
 
     // ── accessors ─────────────────────────────────────────────────────────────
@@ -366,10 +377,11 @@ impl Repository {
 
         let new_view = replace_working_copy(&view, current_wc_id, amended_id);
         let view_id = self.store.put_view(&new_view)?;
-        self.append_op_on_head(view_id, "snapshot working copy", vec![
-            "tack".to_string(),
-            "snapshot".to_string(),
-        ])?;
+        self.append_op_on_head(
+            view_id,
+            "snapshot working copy",
+            vec!["tack".to_string(), "snapshot".to_string()],
+        )?;
 
         Ok(amended_id)
     }
@@ -429,12 +441,18 @@ impl Repository {
         let child_id = self.store.put_snapshot(&child)?;
 
         // The new head is the fresh child; the closed cut is reachable via parent.
-        let new_view = View::new(child_id, view.bookmarks().to_vec(), view.tags().to_vec(), vec![child_id]);
+        let new_view = View::new(
+            child_id,
+            view.bookmarks().to_vec(),
+            view.tags().to_vec(),
+            vec![child_id],
+        );
         let view_id = self.store.put_view(&new_view)?;
-        self.append_op_on_head(view_id, "named cut", vec![
-            "tack".to_string(),
-            "snap".to_string(),
-        ])?;
+        self.append_op_on_head(
+            view_id,
+            "named cut",
+            vec!["tack".to_string(), "snap".to_string()],
+        )?;
 
         Ok(closed_id)
     }
@@ -720,15 +738,24 @@ impl Repository {
 
         let restored_view = self.view_for_target(target)?;
         let view_id = self.store.put_view(&restored_view)?;
-        let new_op = self.append_op_on_head(view_id, format!("restore to {}", target.short()), vec![
-            "tack".to_string(),
-            "restore".to_string(),
-            "--to".to_string(),
-            target.to_string(),
-        ])?;
+        let new_op = self.append_op_on_head(
+            view_id,
+            format!("restore to {}", target.short()),
+            vec![
+                "tack".to_string(),
+                "restore".to_string(),
+                "--to".to_string(),
+                target.to_string(),
+            ],
+        )?;
 
         let working = self.store.get_snapshot(&restored_view.working_copy())?;
-        project(&self.store, &prev_tree, &working.root_tree(), &self.work_dir)?;
+        project(
+            &self.store,
+            &prev_tree,
+            &working.root_tree(),
+            &self.work_dir,
+        )?;
         Ok(new_op)
     }
 
@@ -763,13 +790,19 @@ impl Repository {
         // Re-store the parent's view (content-addressed: this is the same view
         // id) and point a new op at it, parented on the *current* head.
         let view_id = self.store.put_view(&restored_view)?;
-        let new_op = self.append_op_on_head(view_id, format!("undo {}", current.id().short()), vec![
-            "tack".to_string(),
-            "undo".to_string(),
-        ])?;
+        let new_op = self.append_op_on_head(
+            view_id,
+            format!("undo {}", current.id().short()),
+            vec!["tack".to_string(), "undo".to_string()],
+        )?;
 
         let working = self.store.get_snapshot(&restored_view.working_copy())?;
-        project(&self.store, &prev_tree, &working.root_tree(), &self.work_dir)?;
+        project(
+            &self.store,
+            &prev_tree,
+            &working.root_tree(),
+            &self.work_dir,
+        )?;
         Ok(new_op)
     }
 
@@ -916,8 +949,12 @@ impl Repository {
         if !heads.contains(&cut_id) {
             heads.push(cut_id);
         }
-        let new_view =
-            View::new(view.working_copy(), view.bookmarks().to_vec(), view.tags().to_vec(), heads);
+        let new_view = View::new(
+            view.working_copy(),
+            view.bookmarks().to_vec(),
+            view.tags().to_vec(),
+            heads,
+        );
         let view_id = self.store.put_view(&new_view)?;
         let op = self.append_op_on_head(
             view_id,
@@ -930,7 +967,233 @@ impl Repository {
             ],
         )?;
 
-        Ok(ScopedCutOutcome { cut: cut_id, op, base: base_snapshot, captured, outside_changes })
+        Ok(ScopedCutOutcome {
+            cut: cut_id,
+            op,
+            base: base_snapshot,
+            captured,
+            outside_changes,
+        })
+    }
+
+    // ── lanes, admission, and backports ───────────────────────────────────────
+
+    /// Returns the current op-derived team lanes.
+    ///
+    /// Lanes are not stored in [`View`]. They are derived by folding admission
+    /// ops from the operation log, so restore/undo do not silently erase team
+    /// decisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns store errors if the op-log cannot be read.
+    pub fn lanes(&self) -> Result<Vec<Lane>> {
+        Ok(derive_lanes(&self.op_log()?))
+    }
+
+    /// Records that `cut` is admitted to `lane`, leaving the repository view
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the lane is empty or `cut` is not a
+    /// snapshot id.
+    pub fn admit(&self, cut: ObjectId, lane: &str, reason: &str) -> Result<AdmissionOutcome> {
+        let lane = normalise_lane(lane)?;
+        ensure_snapshot_id(&self.store, cut, "admission cut")?;
+
+        let view_id = self.current_op()?.view();
+        let command = admit_command(&lane, cut, reason);
+        let op =
+            self.append_op_on_head(view_id, format!("admit {} to {lane}", cut.short()), command)?;
+        Ok(AdmissionOutcome {
+            lane,
+            cut,
+            op,
+            reason: reason.to_owned(),
+        })
+    }
+
+    /// Creates a target-lane backport proposal from `source_cut`.
+    ///
+    /// A clean backport creates a side-head cut and leaves the working copy
+    /// untouched. A conflicting backport materializes a settlement working copy
+    /// parented on the target lane cut; finish it with
+    /// [`continue_backport`](Self::continue_backport).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the source is not a one-parent
+    /// snapshot, the target lane has no admitted cut, or a related backport is
+    /// already recorded.
+    pub fn backport(
+        &self,
+        source_cut: ObjectId,
+        target_lane: &str,
+        message: Option<String>,
+        reason: &str,
+        author: Identity,
+    ) -> Result<BackportOutcome> {
+        let target_lane = normalise_lane(target_lane)?;
+        let source = self
+            .store
+            .get_snapshot(&source_cut)
+            .map_err(|err| match err {
+                Error::Corruption(_) => Error::InvalidArgument(format!(
+                    "backport source {} is not a snapshot",
+                    source_cut.short()
+                )),
+                other => other,
+            })?;
+        let source_parent = *source.parents().first().ok_or_else(|| {
+            Error::InvalidArgument("backport source must have exactly one parent".to_string())
+        })?;
+        if source.parents().len() != 1 {
+            return Err(Error::InvalidArgument(
+                "backport source must have exactly one parent".to_string(),
+            ));
+        }
+
+        let lane = self
+            .lanes()?
+            .into_iter()
+            .find(|candidate| candidate.name() == target_lane)
+            .ok_or_else(|| {
+                Error::InvalidArgument(format!("target lane {target_lane:?} has no admitted cut"))
+            })?;
+        let target_base = lane.cut();
+
+        if let Some(record) = self.exact_backport(source_cut, &target_lane)? {
+            return Ok(BackportOutcome::AlreadyPorted(record));
+        }
+        if let Some(record) = self.related_backport(source.change_id(), &target_lane)? {
+            return Err(Error::InvalidArgument(format!(
+                "related backport already exists for change {} on {target_lane}: {}",
+                source.change_id().short(),
+                record.result_cut().short()
+            )));
+        }
+
+        let source_base = self.store.get_snapshot(&source_parent)?;
+        let target = self.store.get_snapshot(&target_base)?;
+        let plan = plan_backport(
+            &self.store,
+            source_base.root_tree(),
+            source.root_tree(),
+            target.root_tree(),
+        )?;
+        let message = message.unwrap_or_else(|| format!("Backport: {}", source.message()));
+        let provenance = BackportProvenance::new(
+            source_cut,
+            source.change_id(),
+            self.source_admission_for(source_cut)?,
+            target_lane,
+            target_base,
+            reason.to_owned(),
+        );
+
+        if !plan.conflicts.is_empty() {
+            return self.start_backport_settlement(&plan, provenance, &message);
+        }
+
+        let result_tree = tree_from_files(&self.store, &plan.result)?;
+        let now = oplog::now_timestamp();
+        let cut = Snapshot::new(
+            result_tree,
+            vec![target_base],
+            source.change_id(),
+            author.clone(),
+            author,
+            message,
+            now,
+        );
+        let cut_id = self.store.put_snapshot(&cut)?;
+
+        let view = self.current_view()?;
+        let mut heads = view.heads().to_vec();
+        if !heads.contains(&cut_id) {
+            heads.push(cut_id);
+        }
+        let new_view = View::new(
+            view.working_copy(),
+            view.bookmarks().to_vec(),
+            view.tags().to_vec(),
+            heads,
+        );
+        let view_id = self.store.put_view(&new_view)?;
+        let command = backport_command(&provenance, cut_id, "clean");
+        let op = self.append_op_on_head(
+            view_id,
+            format!(
+                "backport {} to {}",
+                source_cut.short(),
+                provenance.target_lane()
+            ),
+            command,
+        )?;
+
+        Ok(BackportOutcome::Created(BackportRecord::new(
+            provenance, cut_id, op, "clean",
+        )))
+    }
+
+    /// Finishes the currently materialized manual backport settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] if the current op is not a pending
+    /// backport settlement.
+    pub fn continue_backport(&self, author: Identity) -> Result<BackportOutcome> {
+        let pending_op = self.current_op()?;
+        let pending = parse_pending_backport(pending_op.metadata().command()).ok_or_else(|| {
+            Error::InvalidArgument("current state is not a pending backport settlement".to_string())
+        })?;
+
+        self.snapshot_working_copy()?;
+        let view = self.current_view()?;
+        let working = self.store.get_snapshot(&view.working_copy())?;
+        let now = oplog::now_timestamp();
+        let resolved = Snapshot::new(
+            working.root_tree(),
+            vec![pending.provenance.target_base()],
+            pending.provenance.source_change_id(),
+            author.clone(),
+            author,
+            pending.message,
+            now,
+        );
+        let resolved_id = self.store.put_snapshot(&resolved)?;
+
+        let default_id = default_identity();
+        let child = Snapshot::new(
+            working.root_tree(),
+            vec![resolved_id],
+            new_change_id(),
+            default_id.clone(),
+            default_id,
+            String::new(),
+            now,
+        );
+        let child_id = self.store.put_snapshot(&child)?;
+        let new_view = replace_working_copy(&view, view.working_copy(), child_id);
+        let view_id = self.store.put_view(&new_view)?;
+        let command = backport_command(&pending.provenance, resolved_id, "manual");
+        let op = self.append_op_on_head(
+            view_id,
+            format!(
+                "finish backport {} to {}",
+                pending.provenance.source_cut().short(),
+                pending.provenance.target_lane()
+            ),
+            command,
+        )?;
+
+        Ok(BackportOutcome::Created(BackportRecord::new(
+            pending.provenance,
+            resolved_id,
+            op,
+            "manual",
+        )))
     }
 
     /// Resolves a scoped-cut base id to a snapshot id: a snapshot is used
@@ -949,7 +1212,10 @@ impl Repository {
         let (tag, _bytes) = self.store.get_raw(&id)?;
         match tag {
             TypeTag::Snapshot => Ok(id),
-            TypeTag::Op => Ok(self.store.get_view(&self.store.get_op(&id)?.view())?.working_copy()),
+            TypeTag::Op => Ok(self
+                .store
+                .get_view(&self.store.get_op(&id)?.view())?
+                .working_copy()),
             _ => Err(Error::InvalidArgument(format!(
                 "{what} {} is neither a snapshot nor an op",
                 id.short()
@@ -982,7 +1248,8 @@ impl Repository {
     /// * [`Error::PrefixNotFound`] if no object matches.
     /// * [`Error::Corruption`] if the prefix is ambiguous (matches ≥ 2 objects).
     pub fn resolve_prefix(&self, prefix: &str) -> Result<ObjectId> {
-        if prefix.is_empty() || prefix.len() > 64 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if prefix.is_empty() || prefix.len() > 64 || !prefix.bytes().all(|b| b.is_ascii_hexdigit())
+        {
             return Err(Error::InvalidObjectId(prefix.to_string()));
         }
         let prefix = prefix.to_ascii_lowercase();
@@ -1057,7 +1324,14 @@ impl Repository {
     ) -> Result<ObjectId> {
         let parent = oplog::op_head(&self.tack_dir)?;
         let parents = parent.into_iter().collect();
-        oplog::append_op(&self.store, &self.tack_dir, parents, view_id, description, command)
+        oplog::append_op(
+            &self.store,
+            &self.tack_dir,
+            parents,
+            view_id,
+            description,
+            command,
+        )
     }
 
     /// Loads the [`Snapshot`] a [`diff`](Self::diff) endpoint id names.
@@ -1091,6 +1365,91 @@ impl Repository {
                 target.short()
             ))),
         }
+    }
+
+    fn start_backport_settlement(
+        &self,
+        plan: &BackportPlan,
+        provenance: BackportProvenance,
+        message: &str,
+    ) -> Result<BackportOutcome> {
+        self.snapshot_working_copy()?;
+        let view = self.current_view()?;
+        let prev_tree = self.store.get_snapshot(&view.working_copy())?.root_tree();
+        let result_tree = tree_from_files(&self.store, &plan.result)?;
+
+        let identity = default_identity();
+        let settlement = Snapshot::new(
+            result_tree,
+            vec![provenance.target_base()],
+            provenance.source_change_id(),
+            identity.clone(),
+            identity,
+            String::new(),
+            oplog::now_timestamp(),
+        );
+        let settlement_id = self.store.put_snapshot(&settlement)?;
+        let new_view = replace_working_copy(&view, view.working_copy(), settlement_id);
+        let view_id = self.store.put_view(&new_view)?;
+        let command = pending_backport_command(&provenance, message, &plan.conflicts);
+        let op = self.append_op_on_head(
+            view_id,
+            format!(
+                "settle backport {} to {}",
+                provenance.source_cut().short(),
+                provenance.target_lane()
+            ),
+            command,
+        )?;
+        project(&self.store, &prev_tree, &result_tree, &self.work_dir)?;
+
+        Ok(BackportOutcome::Settlement(BackportSettlement {
+            provenance,
+            op,
+            conflicts: plan.conflicts.clone(),
+        }))
+    }
+
+    fn exact_backport(
+        &self,
+        source_cut: ObjectId,
+        target_lane: &str,
+    ) -> Result<Option<BackportRecord>> {
+        Ok(self.backport_records()?.into_iter().find(|record| {
+            record.source_cut() == source_cut && record.target_lane() == target_lane
+        }))
+    }
+
+    fn related_backport(
+        &self,
+        source_change_id: ObjectId,
+        target_lane: &str,
+    ) -> Result<Option<BackportRecord>> {
+        Ok(self.backport_records()?.into_iter().find(|record| {
+            record.source_change_id() == source_change_id && record.target_lane() == target_lane
+        }))
+    }
+
+    fn backport_records(&self) -> Result<Vec<BackportRecord>> {
+        let mut records = Vec::new();
+        for op in self.op_log()? {
+            if let Some(mut record) = parse_backport_record(op.metadata().command()) {
+                record.op = op.id();
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    fn source_admission_for(&self, cut: ObjectId) -> Result<Option<SourceAdmission>> {
+        Ok(derive_admissions(&self.op_log()?)
+            .into_iter()
+            .rev()
+            .find(|admission| admission.cut() == cut)
+            .map(|admission| SourceAdmission {
+                lane: admission.name().to_owned(),
+                op: admission.admission(),
+            }))
     }
 }
 
@@ -1139,11 +1498,479 @@ impl ScopedCutOutcome {
     }
 }
 
+/// One lane admission derived from the op-log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lane {
+    name: String,
+    cut: ObjectId,
+    admission: ObjectId,
+    reason: String,
+    timestamp: i64,
+}
+
+impl Lane {
+    /// Returns the lane name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the currently admitted cut.
+    pub const fn cut(&self) -> ObjectId {
+        self.cut
+    }
+
+    /// Returns the op that admitted the current cut.
+    pub const fn admission(&self) -> ObjectId {
+        self.admission
+    }
+
+    /// Returns the admission reason, if any.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Returns the admission timestamp as Unix seconds.
+    pub const fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+}
+
+/// The outcome of admitting a cut into a lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionOutcome {
+    lane: String,
+    cut: ObjectId,
+    op: ObjectId,
+    reason: String,
+}
+
+impl AdmissionOutcome {
+    /// Returns the lane name.
+    pub fn lane(&self) -> &str {
+        &self.lane
+    }
+
+    /// Returns the admitted cut id.
+    pub const fn cut(&self) -> ObjectId {
+        self.cut
+    }
+
+    /// Returns the op that recorded the admission.
+    pub const fn op(&self) -> ObjectId {
+        self.op
+    }
+
+    /// Returns the admission reason.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// The result of a backport operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackportOutcome {
+    /// A new target-lane cut was created.
+    Created(BackportRecord),
+    /// A settlement working copy was materialized and must be continued.
+    Settlement(BackportSettlement),
+    /// The same source cut was already ported to the target lane.
+    AlreadyPorted(BackportRecord),
+}
+
+impl BackportOutcome {
+    /// Returns the target-lane result cut when one exists.
+    pub const fn result_cut(&self) -> Option<ObjectId> {
+        match self {
+            Self::Created(record) | Self::AlreadyPorted(record) => Some(record.result_cut),
+            Self::Settlement(_) => None,
+        }
+    }
+}
+
+/// Provenance recorded for a target-lane backport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackportProvenance {
+    source_cut: ObjectId,
+    source_change_id: ObjectId,
+    source_admission: Option<SourceAdmission>,
+    target_lane: String,
+    target_base: ObjectId,
+    reason: String,
+}
+
+impl BackportProvenance {
+    const fn new(
+        source_cut: ObjectId,
+        source_change_id: ObjectId,
+        source_admission: Option<SourceAdmission>,
+        target_lane: String,
+        target_base: ObjectId,
+        reason: String,
+    ) -> Self {
+        Self {
+            source_cut,
+            source_change_id,
+            source_admission,
+            target_lane,
+            target_base,
+            reason,
+        }
+    }
+
+    /// Returns the source fix cut id.
+    pub const fn source_cut(&self) -> ObjectId {
+        self.source_cut
+    }
+
+    /// Returns the logical source change id.
+    pub const fn source_change_id(&self) -> ObjectId {
+        self.source_change_id
+    }
+
+    /// Returns the source admission, if the source cut was admitted to a lane.
+    pub const fn source_admission(&self) -> Option<&SourceAdmission> {
+        self.source_admission.as_ref()
+    }
+
+    /// Returns the target lane name.
+    pub fn target_lane(&self) -> &str {
+        &self.target_lane
+    }
+
+    /// Returns the target base cut id.
+    pub const fn target_base(&self) -> ObjectId {
+        self.target_base
+    }
+
+    /// Returns the reason supplied for the backport.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+/// A source lane admission referenced by backport provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceAdmission {
+    lane: String,
+    op: ObjectId,
+}
+
+impl SourceAdmission {
+    /// Returns the source lane name.
+    pub fn lane(&self) -> &str {
+        &self.lane
+    }
+
+    /// Returns the source admission op id.
+    pub const fn op(&self) -> ObjectId {
+        self.op
+    }
+}
+
+/// A completed clean or manual backport record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackportRecord {
+    provenance: BackportProvenance,
+    result_cut: ObjectId,
+    op: ObjectId,
+    method: String,
+}
+
+impl BackportRecord {
+    fn new(
+        provenance: BackportProvenance,
+        result_cut: ObjectId,
+        op: ObjectId,
+        method: impl Into<String>,
+    ) -> Self {
+        Self {
+            provenance,
+            result_cut,
+            op,
+            method: method.into(),
+        }
+    }
+
+    /// Returns the backport provenance.
+    pub const fn provenance(&self) -> &BackportProvenance {
+        &self.provenance
+    }
+
+    /// Returns the source fix cut id.
+    pub const fn source_cut(&self) -> ObjectId {
+        self.provenance.source_cut
+    }
+
+    /// Returns the source logical change id.
+    pub const fn source_change_id(&self) -> ObjectId {
+        self.provenance.source_change_id
+    }
+
+    /// Returns the target lane name.
+    pub fn target_lane(&self) -> &str {
+        &self.provenance.target_lane
+    }
+
+    /// Returns the resulting target-lane cut.
+    pub const fn result_cut(&self) -> ObjectId {
+        self.result_cut
+    }
+
+    /// Returns the op that recorded the completed backport.
+    pub const fn op(&self) -> ObjectId {
+        self.op
+    }
+
+    /// Returns the completion method (`clean` or `manual`).
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+}
+
+/// A materialized backport settlement that needs manual continuation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackportSettlement {
+    provenance: BackportProvenance,
+    op: ObjectId,
+    conflicts: Vec<String>,
+}
+
+impl BackportSettlement {
+    /// Returns the pending backport provenance.
+    pub const fn provenance(&self) -> &BackportProvenance {
+        &self.provenance
+    }
+
+    /// Returns the op that materialized the settlement.
+    pub const fn op(&self) -> ObjectId {
+        self.op
+    }
+
+    /// Returns the conflicted paths.
+    pub fn conflicts(&self) -> &[String] {
+        &self.conflicts
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BackportPlan {
+    result: BTreeMap<PathBuf, FileNode>,
+    conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBackport {
+    provenance: BackportProvenance,
+    message: String,
+}
+
+fn normalise_lane(lane: &str) -> Result<String> {
+    let lane = lane.trim();
+    if lane.is_empty() {
+        return Err(Error::InvalidArgument("lane must not be empty".to_string()));
+    }
+    Ok(lane.to_owned())
+}
+
+fn ensure_snapshot_id(store: &ObjectStore, id: ObjectId, what: &str) -> Result<()> {
+    let (tag, _) = store.get_raw(&id)?;
+    if tag == TypeTag::Snapshot {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "{what} {} is not a snapshot",
+            id.short()
+        )))
+    }
+}
+
+fn admit_command(lane: &str, cut: ObjectId, reason: &str) -> Vec<String> {
+    vec![
+        "tack".to_string(),
+        "admit".to_string(),
+        format!("lane={lane}"),
+        format!("cut={cut}"),
+        format!("reason={reason}"),
+    ]
+}
+
+fn backport_command(
+    provenance: &BackportProvenance,
+    result_cut: ObjectId,
+    method: &str,
+) -> Vec<String> {
+    let mut command = provenance_command("backport", provenance);
+    command.push(format!("result_cut={result_cut}"));
+    command.push(format!("method={method}"));
+    command
+}
+
+fn pending_backport_command(
+    provenance: &BackportProvenance,
+    message: &str,
+    conflicts: &[String],
+) -> Vec<String> {
+    let mut command = provenance_command("backport_settle", provenance);
+    command.push(format!("message={message}"));
+    for conflict in conflicts {
+        command.push(format!("conflict={conflict}"));
+    }
+    command
+}
+
+fn provenance_command(verb: &str, provenance: &BackportProvenance) -> Vec<String> {
+    let mut command = vec![
+        "tack".to_string(),
+        verb.to_string(),
+        format!("source_cut={}", provenance.source_cut),
+        format!("source_change_id={}", provenance.source_change_id),
+        format!("target_lane={}", provenance.target_lane),
+        format!("target_base={}", provenance.target_base),
+        format!("reason={}", provenance.reason),
+    ];
+    if let Some(source) = &provenance.source_admission {
+        command.push(format!("source_lane={}", source.lane));
+        command.push(format!("source_admission={}", source.op));
+    }
+    command
+}
+
+fn parse_key<'a>(command: &'a [String], key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    command.iter().find_map(|arg| arg.strip_prefix(&prefix))
+}
+
+fn parse_object_key(command: &[String], key: &str) -> Option<ObjectId> {
+    parse_key(command, key).and_then(|value| value.parse().ok())
+}
+
+fn parse_admission(op: &Op) -> Option<Lane> {
+    let command = op.metadata().command();
+    if command.get(1).is_none_or(|verb| verb != "admit") {
+        return None;
+    }
+    let name = parse_key(command, "lane")?.to_owned();
+    let cut = parse_object_key(command, "cut")?;
+    let reason = parse_key(command, "reason").unwrap_or("").to_owned();
+    Some(Lane {
+        name,
+        cut,
+        admission: op.id(),
+        reason,
+        timestamp: op.metadata().start().unix_secs(),
+    })
+}
+
+fn derive_admissions(ops: &[Op]) -> Vec<Lane> {
+    ops.iter().rev().filter_map(parse_admission).collect()
+}
+
+fn derive_lanes(ops: &[Op]) -> Vec<Lane> {
+    let mut lanes = BTreeMap::<String, Lane>::new();
+    for admission in derive_admissions(ops) {
+        lanes.insert(admission.name.clone(), admission);
+    }
+    lanes.into_values().collect()
+}
+
+fn parse_provenance(command: &[String]) -> Option<BackportProvenance> {
+    let source_cut = parse_object_key(command, "source_cut")?;
+    let source_change_id = parse_object_key(command, "source_change_id")?;
+    let target_lane = parse_key(command, "target_lane")?.to_owned();
+    let target_base = parse_object_key(command, "target_base")?;
+    let reason = parse_key(command, "reason").unwrap_or("").to_owned();
+    let source_lane = parse_key(command, "source_lane").map(str::to_owned);
+    let source_admission = parse_object_key(command, "source_admission");
+    let source_admission = match (source_lane, source_admission) {
+        (Some(lane), Some(op)) => Some(SourceAdmission { lane, op }),
+        _ => None,
+    };
+    Some(BackportProvenance::new(
+        source_cut,
+        source_change_id,
+        source_admission,
+        target_lane,
+        target_base,
+        reason,
+    ))
+}
+
+fn parse_backport_record(command: &[String]) -> Option<BackportRecord> {
+    if command.get(1).is_none_or(|verb| verb != "backport") {
+        return None;
+    }
+    let provenance = parse_provenance(command)?;
+    let result_cut = parse_object_key(command, "result_cut")?;
+    let method = parse_key(command, "method").unwrap_or("clean").to_owned();
+    Some(BackportRecord::new(
+        provenance,
+        result_cut,
+        ObjectId::from_bytes([0; 32]),
+        method,
+    ))
+}
+
+fn parse_pending_backport(command: &[String]) -> Option<PendingBackport> {
+    if command.get(1).is_none_or(|verb| verb != "backport_settle") {
+        return None;
+    }
+    Some(PendingBackport {
+        provenance: parse_provenance(command)?,
+        message: parse_key(command, "message")?.to_owned(),
+    })
+}
+
+fn plan_backport(
+    store: &ObjectStore,
+    source_base_tree: ObjectId,
+    source_tree: ObjectId,
+    target_tree: ObjectId,
+) -> Result<BackportPlan> {
+    let source_base = flatten_tree_full(store, &source_base_tree)?;
+    let source = flatten_tree_full(store, &source_tree)?;
+    let target = flatten_tree_full(store, &target_tree)?;
+    let mut result = target.clone();
+    let mut conflicts = Vec::new();
+
+    let mut paths = BTreeSet::new();
+    paths.extend(source_base.keys().cloned());
+    paths.extend(source.keys().cloned());
+
+    for path in paths {
+        let before = source_base.get(&path);
+        let after = source.get(&path);
+        if before == after {
+            continue;
+        }
+        let target_node = target.get(&path);
+        match (before, after, target_node) {
+            (None, Some(new), None) => {
+                result.insert(path, *new);
+            }
+            (None, Some(new), Some(existing)) if existing == new => {}
+            (Some(old), None, Some(existing)) if existing == old => {
+                result.remove(&path);
+            }
+            (Some(_old), None, None) => {}
+            (Some(old), Some(new), Some(existing)) if existing == old => {
+                result.insert(path, *new);
+            }
+            (Some(_old), Some(new), Some(existing)) if existing == new => {}
+            _ => conflicts.push(path_to_slash(&path)),
+        }
+    }
+
+    conflicts.sort();
+    Ok(BackportPlan { result, conflicts })
+}
+
 /// Returns `true` if a repo-relative `path` falls under any scope selector
 /// (equal to it, or nested beneath it as a directory).
 fn path_in_scope(path: &Path, scope: &[String]) -> bool {
     let p = path_to_slash(path);
-    scope.iter().any(|sel| p == *sel || p.starts_with(&format!("{sel}/")))
+    scope
+        .iter()
+        .any(|sel| p == *sel || p.starts_with(&format!("{sel}/")))
 }
 
 /// Compares `base` vs `live` file maps, returning `(captured, outside_changes)`:
@@ -1388,7 +2215,11 @@ mod tests {
 
         write_file(dir.path(), "hello.txt", b"world");
         let new_wc = repo.snapshot_working_copy()?;
-        assert_ne!(new_wc, before.id(), "writing a file must change the working copy");
+        assert_ne!(
+            new_wc,
+            before.id(),
+            "writing a file must change the working copy"
+        );
 
         // The captured tree contains the file.
         let wc = repo.store().get_snapshot(&new_wc)?;
@@ -1408,7 +2239,11 @@ mod tests {
         let first = repo.snapshot_working_copy()?;
         let second = repo.snapshot_working_copy()?;
         assert_eq!(first, second, "unchanged snapshot must be a no-op");
-        assert_eq!(repo.op_log()?.len(), ops_before, "no-op must not append an op");
+        assert_eq!(
+            repo.op_log()?.len(),
+            ops_before,
+            "no-op must not append an op"
+        );
         Ok(())
     }
 
@@ -1425,13 +2260,19 @@ mod tests {
 
         // First build writes the cache; the file must now exist.
         let with_cache = repo.live_tree()?;
-        assert!(repo.wc_cache_path().is_file(), "a capture must persist the stat cache");
+        assert!(
+            repo.wc_cache_path().is_file(),
+            "a capture must persist the stat cache"
+        );
 
         // Wipe the cache → the next build cannot reuse anything (full rebuild).
         std::fs::remove_file(repo.wc_cache_path())?;
         let rebuilt = repo.live_tree()?;
 
-        assert_eq!(with_cache, rebuilt, "the cache must never change the captured tree");
+        assert_eq!(
+            with_cache, rebuilt,
+            "the cache must never change the captured tree"
+        );
         Ok(())
     }
 
@@ -1445,15 +2286,25 @@ mod tests {
 
         let t1 = repo.live_tree()?; // populates the cache
         let t1_again = repo.live_tree()?; // cache hit, identical content
-        assert_eq!(t1, t1_again, "unchanged content must yield the same tree (cache hit)");
+        assert_eq!(
+            t1, t1_again,
+            "unchanged content must yield the same tree (cache hit)"
+        );
 
         write_file(dir.path(), "a.txt", b"one and two\n"); // edit (different size)
         let t2 = repo.live_tree()?;
-        assert_ne!(t2, t1, "an edit must change the tree even through the cache");
+        assert_ne!(
+            t2, t1,
+            "an edit must change the tree even through the cache"
+        );
 
         // And a cacheless rebuild of the edited tree agrees.
         std::fs::remove_file(repo.wc_cache_path())?;
-        assert_eq!(repo.live_tree()?, t2, "edited tree must match a cacheless rebuild");
+        assert_eq!(
+            repo.live_tree()?,
+            t2,
+            "edited tree must match a cacheless rebuild"
+        );
         Ok(())
     }
 
@@ -1587,7 +2438,11 @@ mod tests {
             .iter()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .collect();
-        assert_eq!(modified, vec!["a.txt"], "default diff must reflect dirty disk");
+        assert_eq!(
+            modified,
+            vec!["a.txt"],
+            "default diff must reflect dirty disk"
+        );
 
         // Line-level diff sees the added line at the hunk level.
         let patch = repo.diff_patch(None, None)?;
@@ -1606,8 +2461,16 @@ mod tests {
         );
 
         // Read-only with respect to history: no op appended, head unmoved.
-        assert_eq!(repo.op_log()?.len(), ops_before, "diff must not append an op");
-        assert_eq!(oplog::op_head(repo.tack_dir())?, head_before, "diff must not move the op-head");
+        assert_eq!(
+            repo.op_log()?.len(),
+            ops_before,
+            "diff must not append an op"
+        );
+        assert_eq!(
+            oplog::op_head(repo.tack_dir())?,
+            head_before,
+            "diff must not move the op-head"
+        );
         Ok(())
     }
 
@@ -1642,10 +2505,22 @@ mod tests {
 
         let st = repo.status()?;
         let df = repo.diff(None, None)?;
-        assert_eq!(sorted_slashed(st.added()), sorted_slashed(df.added()), "added must agree");
-        assert_eq!(sorted_slashed(st.modified()), sorted_slashed(df.modified()), "modified must agree");
+        assert_eq!(
+            sorted_slashed(st.added()),
+            sorted_slashed(df.added()),
+            "added must agree"
+        );
+        assert_eq!(
+            sorted_slashed(st.modified()),
+            sorted_slashed(df.modified()),
+            "modified must agree"
+        );
         // status calls deletions `deleted`; the tree diff calls them `removed`.
-        assert_eq!(sorted_slashed(st.deleted()), sorted_slashed(df.removed()), "deletions must agree");
+        assert_eq!(
+            sorted_slashed(st.deleted()),
+            sorted_slashed(df.removed()),
+            "deletions must agree"
+        );
         Ok(())
     }
 
@@ -1669,11 +2544,18 @@ mod tests {
         repo.snapshot_working_copy()?;
 
         // status: disk == recorded working copy → clean.
-        assert!(repo.status()?.is_clean(), "status compares disk to the recorded WC → clean after amend");
+        assert!(
+            repo.status()?.is_clean(),
+            "status compares disk to the recorded WC → clean after amend"
+        );
 
         // diff: disk ('two') vs the last cut ('one') → still modified.
         let df = repo.diff(None, None)?;
-        assert_eq!(sorted_slashed(df.modified()), vec!["a.txt"], "diff compares disk to the last cut → modified");
+        assert_eq!(
+            sorted_slashed(df.modified()),
+            vec!["a.txt"],
+            "diff compares disk to the last cut → modified"
+        );
         Ok(())
     }
 
@@ -1730,7 +2612,9 @@ mod tests {
 
         // A tree id is neither a snapshot nor an op → clear InvalidArgument.
         let tree_id = repo.working_copy()?.root_tree();
-        let err = repo.diff(None, Some(tree_id)).expect_err("a tree id is not a diff endpoint");
+        let err = repo
+            .diff(None, Some(tree_id))
+            .expect_err("a tree id is not a diff endpoint");
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "a tree id must be rejected as InvalidArgument, got {err:?}"
@@ -1795,11 +2679,17 @@ mod tests {
         repo.restore(cut1)?;
         // f1 remains, f2 is gone — the working dir matches the restored tree.
         assert_eq!(fs::read(dir.path().join("f1.txt"))?, b"one");
-        assert!(!dir.path().join("f2.txt").exists(), "f2 must be removed by restore");
+        assert!(
+            !dir.path().join("f2.txt").exists(),
+            "f2 must be removed by restore"
+        );
 
         // And status against the restored working copy must be clean (no
         // resurrected f2 reported as added).
-        assert!(repo.status()?.is_clean(), "working dir must equal the restored tree");
+        assert!(
+            repo.status()?.is_clean(),
+            "working dir must equal the restored tree"
+        );
         Ok(())
     }
 
@@ -1820,7 +2710,10 @@ mod tests {
 
         repo.restore(cut1)?;
         assert!(!dir.path().join("f2.txt").exists(), "tracked file removed");
-        assert!(dir.path().join("scratch.tmp").is_file(), "untracked file preserved");
+        assert!(
+            dir.path().join("scratch.tmp").is_file(),
+            "untracked file preserved"
+        );
         Ok(())
     }
 
@@ -1929,7 +2822,10 @@ mod tests {
     fn resolve_prefix_rejects_non_hex() {
         let dir = TempDir::new().expect("temp");
         let repo = Repository::init(dir.path()).expect("init");
-        assert!(matches!(repo.resolve_prefix("zz"), Err(Error::InvalidObjectId(_))));
+        assert!(matches!(
+            repo.resolve_prefix("zz"),
+            Err(Error::InvalidObjectId(_))
+        ));
     }
 
     #[test]
@@ -1949,10 +2845,18 @@ mod tests {
         // prefix instead.
         let dir = TempDir::new()?;
         let repo = Repository::init(dir.path())?;
-        let err = repo.resolve_prefix("ffffffffffff").expect_err("must not match");
+        let err = repo
+            .resolve_prefix("ffffffffffff")
+            .expect_err("must not match");
         let msg = err.to_string();
-        assert!(msg.contains("ffffffffffff"), "message must carry the prefix: {msg}");
-        assert!(!msg.contains("0000000000000000"), "must not leak a zero-id sentinel: {msg}");
+        assert!(
+            msg.contains("ffffffffffff"),
+            "message must carry the prefix: {msg}"
+        );
+        assert!(
+            !msg.contains("0000000000000000"),
+            "must not leak a zero-id sentinel: {msg}"
+        );
         Ok(())
     }
 
@@ -1984,7 +2888,11 @@ mod tests {
 
         write_file(dir.path(), "b.txt", b"two");
         let cut2 = repo.named_cut("c2", alice())?;
-        assert_eq!(repo.base_cut()?.map(|s| s.id()), Some(cut2), "base advances to the newest cut");
+        assert_eq!(
+            repo.base_cut()?.map(|s| s.id()),
+            Some(cut2),
+            "base advances to the newest cut"
+        );
         Ok(())
     }
 
@@ -2001,12 +2909,25 @@ mod tests {
         // Restore to cut1: the working copy's lineage no longer includes c2.
         repo.restore(cut1)?;
         let log_msgs: Vec<String> = repo.log()?.iter().map(|s| s.message().to_owned()).collect();
-        assert!(!log_msgs.contains(&"c2".to_string()), "log follows the restored lineage: {log_msgs:?}");
+        assert!(
+            !log_msgs.contains(&"c2".to_string()),
+            "log follows the restored lineage: {log_msgs:?}"
+        );
 
         // all_cuts still surfaces c2 (reachable from an earlier op's view).
-        let all_msgs: Vec<String> = repo.all_cuts()?.iter().map(|s| s.message().to_owned()).collect();
-        assert!(all_msgs.contains(&"c1".to_string()), "all_cuts must include c1: {all_msgs:?}");
-        assert!(all_msgs.contains(&"c2".to_string()), "all_cuts must include the off-lineage c2: {all_msgs:?}");
+        let all_msgs: Vec<String> = repo
+            .all_cuts()?
+            .iter()
+            .map(|s| s.message().to_owned())
+            .collect();
+        assert!(
+            all_msgs.contains(&"c1".to_string()),
+            "all_cuts must include c1: {all_msgs:?}"
+        );
+        assert!(
+            all_msgs.contains(&"c2".to_string()),
+            "all_cuts must include the off-lineage c2: {all_msgs:?}"
+        );
         Ok(())
     }
 
@@ -2044,7 +2965,11 @@ mod tests {
         // Restoring an old working copy must NOT silently drop a peer's claim.
         repo.restore(cut1)?;
         let held = repo.claims()?;
-        assert_eq!(held.len(), 1, "claim survives restore (it lives in the op-log): {held:?}");
+        assert_eq!(
+            held.len(),
+            1,
+            "claim survives restore (it lives in the op-log): {held:?}"
+        );
         assert_eq!(held[0].holder, "bot");
         Ok(())
     }
@@ -2076,9 +3001,15 @@ mod tests {
         let other = crate::tree::read_tree_path(repo.store(), &root, "other/x.txt")?;
         assert_eq!(crate::blob::read_blob(repo.store(), &other.id())?, b"x1");
 
-        assert!(outcome.captured().contains(&"src/model.txt".to_string()), "captured: {:?}", outcome.captured());
         assert!(
-            outcome.outside_changes().contains(&"other/x.txt".to_string()),
+            outcome.captured().contains(&"src/model.txt".to_string()),
+            "captured: {:?}",
+            outcome.captured()
+        );
+        assert!(
+            outcome
+                .outside_changes()
+                .contains(&"other/x.txt".to_string()),
             "outside_changes must flag the uncaptured peer edit: {:?}",
             outcome.outside_changes()
         );
@@ -2100,11 +3031,26 @@ mod tests {
         repo.scoped_cut(&["src".to_string()], "scoped", alice(), None)?;
 
         // The working-copy pointer did not move and disk is unchanged.
-        assert_eq!(repo.working_copy()?.id(), wc_before, "scoped cut must not advance the working copy");
-        assert_eq!(std::fs::read(dir.path().join("other/b.txt"))?, b"b2", "disk must be left as-is");
+        assert_eq!(
+            repo.working_copy()?.id(),
+            wc_before,
+            "scoped cut must not advance the working copy"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("other/b.txt"))?,
+            b"b2",
+            "disk must be left as-is"
+        );
         // The scoped cut is reachable via all_cuts even though it is off-lineage.
-        let all_msgs: Vec<String> = repo.all_cuts()?.iter().map(|s| s.message().to_owned()).collect();
-        assert!(all_msgs.contains(&"scoped".to_string()), "scoped cut must be reachable: {all_msgs:?}");
+        let all_msgs: Vec<String> = repo
+            .all_cuts()?
+            .iter()
+            .map(|s| s.message().to_owned())
+            .collect();
+        assert!(
+            all_msgs.contains(&"scoped".to_string()),
+            "scoped cut must be reachable: {all_msgs:?}"
+        );
         Ok(())
     }
 
@@ -2113,7 +3059,149 @@ mod tests {
         let dir = TempDir::new().expect("temp");
         let repo = Repository::init(dir.path()).expect("init");
         let result = repo.scoped_cut(&[], "msg", alice(), None);
-        assert!(matches!(result, Err(Error::InvalidArgument(_))), "empty scope must be rejected");
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "empty scope must be rejected"
+        );
+    }
+
+    // ── lanes and backports ───────────────────────────────────────────────────
+
+    #[test]
+    fn admit_derives_current_lane_from_op_log() -> Result<()> {
+        let dir = TempDir::new()?;
+        let repo = Repository::init(dir.path())?;
+        write_file(dir.path(), "a.txt", b"one");
+        let cut1 = repo.named_cut("one", alice())?;
+        repo.admit(cut1, "team/main", "seed")?;
+
+        write_file(dir.path(), "a.txt", b"two");
+        let cut2 = repo.named_cut("two", alice())?;
+        let admission = repo.admit(cut2, "team/main", "advance")?;
+
+        let lanes = repo.lanes()?;
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].name(), "team/main");
+        assert_eq!(lanes[0].cut(), cut2);
+        assert_eq!(lanes[0].admission(), admission.op());
+        assert_eq!(lanes[0].reason(), "advance");
+        Ok(())
+    }
+
+    #[test]
+    fn clean_backport_creates_target_lane_cut_with_source_provenance() -> Result<()> {
+        let dir = TempDir::new()?;
+        let repo = Repository::init(dir.path())?;
+        write_file(dir.path(), "a.txt", b"base");
+        let base = repo.named_cut("base", alice())?;
+        repo.admit(base, "team/main", "seed")?;
+        repo.admit(base, "release/7.8.0", "seed")?;
+
+        write_file(dir.path(), "a.txt", b"main fix");
+        let fix = repo.named_cut("fix", alice())?;
+        let source_admission = repo.admit(fix, "team/main", "fix accepted")?;
+        let source = repo.store().get_snapshot(&fix)?;
+
+        let BackportOutcome::Created(record) =
+            repo.backport(fix, "release/7.8.0", None, "hotfix", alice())?
+        else {
+            panic!("expected clean backport");
+        };
+
+        let hotfix = repo.store().get_snapshot(&record.result_cut())?;
+        assert_eq!(
+            hotfix.parents(),
+            &[base],
+            "release cut must parent target lane base"
+        );
+        assert_eq!(
+            hotfix.change_id(),
+            source.change_id(),
+            "logical fix id must carry over"
+        );
+        assert_eq!(record.source_cut(), fix);
+        assert_eq!(record.target_lane(), "release/7.8.0");
+        assert_eq!(record.method(), "clean");
+        let provenance = record.provenance();
+        let source_link = provenance.source_admission().expect("source admission");
+        assert_eq!(source_link.lane(), "team/main");
+        assert_eq!(source_link.op(), source_admission.op());
+
+        let entry = crate::tree::read_tree_path(repo.store(), &hotfix.root_tree(), "a.txt")?;
+        assert_eq!(
+            crate::blob::read_blob(repo.store(), &entry.id())?,
+            b"main fix"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_backport_reports_already_ported() -> Result<()> {
+        let dir = TempDir::new()?;
+        let repo = Repository::init(dir.path())?;
+        write_file(dir.path(), "a.txt", b"base");
+        let base = repo.named_cut("base", alice())?;
+        repo.admit(base, "team/main", "seed")?;
+        repo.admit(base, "release/7.8.0", "seed")?;
+        write_file(dir.path(), "a.txt", b"main fix");
+        let fix = repo.named_cut("fix", alice())?;
+
+        let first = repo.backport(fix, "release/7.8.0", None, "hotfix", alice())?;
+        let second = repo.backport(fix, "release/7.8.0", None, "hotfix", alice())?;
+
+        let Some(first_cut) = first.result_cut() else {
+            panic!("first backport must create a cut");
+        };
+        let BackportOutcome::AlreadyPorted(record) = second else {
+            panic!("second backport must be idempotent");
+        };
+        assert_eq!(record.result_cut(), first_cut);
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_backport_materializes_settlement_and_continue_finalizes() -> Result<()> {
+        let dir = TempDir::new()?;
+        let repo = Repository::init(dir.path())?;
+        write_file(dir.path(), "a.txt", b"base");
+        let base = repo.named_cut("base", alice())?;
+        repo.admit(base, "team/main", "seed")?;
+        repo.admit(base, "release/7.8.0", "seed")?;
+
+        write_file(dir.path(), "a.txt", b"main fix");
+        let fix = repo.named_cut("fix", alice())?;
+        repo.admit(fix, "team/main", "fix accepted")?;
+
+        repo.restore(base)?;
+        write_file(dir.path(), "a.txt", b"release edit");
+        let release = repo.named_cut("release edit", alice())?;
+        repo.admit(release, "release/7.8.0", "release diverged")?;
+
+        let BackportOutcome::Settlement(settlement) =
+            repo.backport(fix, "release/7.8.0", None, "hotfix", alice())?
+        else {
+            panic!("expected settlement");
+        };
+        assert_eq!(settlement.conflicts(), &["a.txt".to_string()]);
+        assert_eq!(std::fs::read(dir.path().join("a.txt"))?, b"release edit");
+
+        write_file(dir.path(), "a.txt", b"manual resolution");
+        let BackportOutcome::Created(record) = repo.continue_backport(alice())? else {
+            panic!("expected manual result");
+        };
+        assert_eq!(record.method(), "manual");
+        let hotfix = repo.store().get_snapshot(&record.result_cut())?;
+        assert_eq!(
+            hotfix.parents(),
+            &[release],
+            "manual cut must parent target lane base"
+        );
+        let entry = crate::tree::read_tree_path(repo.store(), &hotfix.root_tree(), "a.txt")?;
+        assert_eq!(
+            crate::blob::read_blob(repo.store(), &entry.id())?,
+            b"manual resolution"
+        );
+        Ok(())
     }
 
     // ── restore / undo return the new op id ────────────────────────────────────────
@@ -2128,7 +3216,11 @@ mod tests {
         repo.named_cut("v2", alice())?;
 
         let op = repo.restore(cut1)?;
-        assert_eq!(repo.current_op()?.id(), op, "restore must return the new head op id");
+        assert_eq!(
+            repo.current_op()?.id(),
+            op,
+            "restore must return the new head op id"
+        );
         Ok(())
     }
 }

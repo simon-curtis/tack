@@ -37,6 +37,9 @@ tack restore --to <id>         # non-destructive restore (reports new + previous
 tack undo                      # reverse the last operation (also non-destructive)
 tack snap -m "wip" --only src  # scoped cut: capture ONLY these paths
 tack claim src/x.rs --as agent # advisory path claim for parallel agents
+tack admit <cut> --to team/main # admit a cut to a lane
+tack backport <cut> --to release/7.8.0
+tack lanes                     # current lane admissions
 tack schema                    # self-describing agent API (the JSON `help` method)
 tack serve                     # JSON-RPC agent server over stdio (one request/line)
 ```
@@ -87,6 +90,11 @@ tack mount C:\work\my-checkout --snapshot <id>
   hints folded from the op-log, surviving restore, never enforced) and
   `scoped_cut` (checkpoint only selected paths from disk, leaving peers' edits
   out), both with **no on-disk format change**.
+- **Local release lanes and backports** — `admit` records op-derived lane
+  decisions (`team/main`, `release/7.8.0`) and `backport` creates a new
+  target-lane cut carrying the effect of a source fix cut. Source fixes are
+  provenance, not ancestry; conflicts materialize a settlement working copy that
+  is finished with `tack backport --continue`.
 - **ProjFS projection** — a snapshot can be mounted as a virtual working
   directory whose files hydrate lazily from the store.
 

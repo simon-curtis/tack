@@ -61,6 +61,38 @@ independently verifiable (Sigstore / Rekor / SLSA direction).
 
 ---
 
+## Team sync and release flow corollaries
+
+These are consequences of the principles above, not extra primitives.
+
+Team sync is **cut exchange plus team admission**. A team lane (`team/main`,
+`release/7.8.0`, etc.) is a derived view over append-only admission records, not
+a mutable branch. Local work is never replayed or rewritten to make it fit a
+lane; it is either covered, proposed, refreshed, settled, or composed into a
+newer named cut.
+
+There is no rebase or fast-forward concept in tack. Causal containment may prove
+that a newer cut covers an older lane frontier, but that is validation for
+admission, not history movement. Adoption of a team lane is a new operation in
+the local op-log, never an implicit mutation of local work.
+
+A backport is a new target-lane realization of an existing fix. The hotfix cut's
+snapshot parent is the current target lane cut; the source fix belongs in
+provenance, not ancestry. For example, if fix `F` was accepted on `team/main` and
+release cut `R` is current on `release/7.8.0`, then backport cut `H` has
+`parents = [R]` and records `port_of = F`. `F` must not be a snapshot parent of
+`H` unless the release lane actually includes that whole source frontier.
+
+Backport creation and release admission are separate decisions. A convenience
+command may perform both, but it must record both facts and pass the same release
+policy. Port provenance must be rich enough to answer what was ported, from
+where, onto which target base, by whom, why, whether it was clean or manually
+settled, and which target cut resulted. "Already ported" checks must use logical
+fix identity, target lane, and provenance first; content equivalence is only a
+secondary signal.
+
+---
+
 ## Scope discipline
 
 v0 is **local-only, single-user, Windows-first**. We are building the *primitive*,

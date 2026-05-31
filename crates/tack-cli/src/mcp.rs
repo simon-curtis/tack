@@ -46,7 +46,7 @@ fn env_first(keys: &[&str]) -> Option<String> {
 
 /// The set of methods for which `author_name`/`author_email` are removed from
 /// the `required` list (the MCP server fills them from the environment).
-const AUTHOR_FILL_METHODS: &[&str] = &["named_cut", "scoped_cut"];
+const AUTHOR_FILL_METHODS: &[&str] = &["named_cut", "scoped_cut", "backport", "backport_continue"];
 
 /// Maps a tack param type string to its JSON Schema property object.
 fn param_type_to_json_schema(ty: &str) -> Value {
