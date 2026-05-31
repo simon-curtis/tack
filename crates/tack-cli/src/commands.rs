@@ -16,7 +16,7 @@
 //! ([`snapshot_working_copy`](Repository::snapshot_working_copy)). With `-m`, it
 //! closes a named cut via [`named_cut`](Repository::named_cut).
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1116,6 +1116,14 @@ pub fn mcp() -> Result<()> {
 /// Fails only on stdout write errors.
 pub fn hook_pre_tool_use() -> Result<()> {
     let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        let mut stderr = std::io::stderr();
+        let _ = writeln!(
+            stderr,
+            "tack hook pre-tool-use expects a PreToolUse JSON event on stdin"
+        );
+        return Ok(());
+    }
     let stdout = std::io::stdout();
     crate::hook::pre_tool_use(stdin.lock(), &mut stdout.lock())
 }

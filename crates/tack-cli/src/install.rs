@@ -386,21 +386,8 @@ fn shell_single_quote(text: &str) -> String {
 }
 
 /// The command string used to identify our hook entry (for deduplication).
-fn our_hook_command(exe_path: &Path) -> String {
-    if cfg!(windows) {
-        let windows_path = exe_path.display().to_string();
-        let fallback_path = windows_path.replace('\\', "/");
-        return format!(
-            "if command -v wslpath >/dev/null 2>&1; then \"$(wslpath -u {})\" hook pre-tool-use; else {} hook pre-tool-use; fi",
-            shell_single_quote(&windows_path),
-            shell_single_quote(&fallback_path)
-        );
-    }
-
-    format!(
-        "{} hook pre-tool-use",
-        shell_single_quote(&exe_path.display().to_string())
-    )
+fn our_hook_command(_exe_path: &Path) -> String {
+    "tack hook pre-tool-use".to_owned()
 }
 
 /// The old shell-style command string written by earlier installers.
@@ -413,11 +400,23 @@ fn powershell_hook_command(exe_path: &Path) -> String {
     format!("& \"{}\" hook pre-tool-use", exe_path.display())
 }
 
+/// The Windows Bash bridge command briefly written by the installer.
+fn wslpath_hook_command(exe_path: &Path) -> String {
+    let windows_path = exe_path.display().to_string();
+    let fallback_path = windows_path.replace('\\', "/");
+    format!(
+        "if command -v wslpath >/dev/null 2>&1; then \"$(wslpath -u {})\" hook pre-tool-use; else {} hook pre-tool-use; fi",
+        shell_single_quote(&windows_path),
+        shell_single_quote(&fallback_path)
+    )
+}
+
 fn managed_hook_commands(exe_path: &Path) -> Vec<String> {
     let mut commands = vec![
         our_hook_command(exe_path),
         legacy_shell_hook_command(exe_path),
         powershell_hook_command(exe_path),
+        wslpath_hook_command(exe_path),
     ];
     commands.dedup();
     commands
@@ -426,15 +425,6 @@ fn managed_hook_commands(exe_path: &Path) -> Vec<String> {
 #[cfg(test)]
 fn command_uses_only_bash_syntax(command: &str) -> bool {
     !command.trim_start().starts_with('&')
-}
-
-#[cfg(test)]
-fn command_uses_windows_bash_bridge(command: &str) -> bool {
-    if cfg!(windows) {
-        command.contains("wslpath -u") && command.contains(":/")
-    } else {
-        true
-    }
 }
 
 fn hook_entry_has_command(entry: &Value, predicate: impl Fn(&str) -> bool) -> bool {
@@ -988,26 +978,11 @@ mod tests {
     #[test]
     fn hook_command_uses_platform_shell_syntax() {
         let command = our_hook_command(&fake_exe());
-        if cfg!(windows) {
-            assert!(
-                command_uses_only_bash_syntax(&command),
-                "hook command must be Bash syntax, got {command}"
-            );
-            assert!(
-                command_uses_windows_bash_bridge(&command),
-                "Windows hook command must bridge through wslpath with a slash-path fallback: {command}"
-            );
-            assert!(
-                command.contains("'C:\\fake\\tack.exe'"),
-                "wslpath input must keep the Windows path: {command}"
-            );
-            assert!(
-                command.contains("'C:/fake/tack.exe'"),
-                "fallback path must be Bash-friendly: {command}"
-            );
-        } else {
-            assert_eq!(command, r"'C:\fake\tack.exe' hook pre-tool-use");
-        }
+        assert_eq!(command, "tack hook pre-tool-use");
+        assert!(
+            command_uses_only_bash_syntax(&command),
+            "hook command must be shell-neutral syntax, got {command}"
+        );
     }
 
     #[test]
@@ -1150,6 +1125,32 @@ mod tests {
         assert!(command_uses_only_bash_syntax(
             arr[0]["hooks"][0]["command"].as_str().expect("command")
         ));
+    }
+
+    #[test]
+    fn merge_hook_entry_replaces_wslpath_command() {
+        let exe = fake_exe();
+        let wslpath_command = wslpath_hook_command(&exe);
+        let mut value = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{
+                            "type": "command",
+                            "command": wslpath_command,
+                            "timeout": 10
+                        }]
+                    }
+                ]
+            }
+        });
+
+        let changed = merge_hook_entry(&mut value, &exe, "Bash");
+        let arr = value["hooks"]["PreToolUse"].as_array().expect("array");
+        assert!(changed);
+        assert_eq!(arr.len(), 1, "wslpath entry must not be duplicated");
+        assert_eq!(arr[0]["hooks"][0]["command"], our_hook_command(&exe));
     }
 
     #[test]

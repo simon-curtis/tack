@@ -201,6 +201,14 @@ fn deny_message(subcommand: Option<&str>) -> &'static str {
 
 // ── core handler ─────────────────────────────────────────────────────────────
 
+fn read_event(input: impl Read) -> Option<serde_json::Value> {
+    let mut events = serde_json::Deserializer::from_reader(input).into_iter::<serde_json::Value>();
+    match events.next() {
+        Some(Ok(event)) => Some(event),
+        _ => None,
+    }
+}
+
 /// Decides a `PreToolUse` event read from `input`, writing any decision JSON to `out`.
 ///
 /// The contract: write nothing for ALLOW; write a deny JSON object for DENY.
@@ -212,9 +220,8 @@ fn deny_message(subcommand: Option<&str>) -> &'static str {
 /// the input are treated as ALLOW to be safe.
 pub fn pre_tool_use(input: impl Read, out: &mut impl Write) -> Result<()> {
     // Parse input; on any error → allow (hook must not crash).
-    let event: serde_json::Value = match serde_json::from_reader(input) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
+    let Some(event) = read_event(input) else {
+        return Ok(());
     };
 
     // Rule 1: only intercept Bash tool calls.
@@ -280,6 +287,7 @@ pub fn pre_tool_use(input: impl Read, out: &mut impl Write) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
 
     use tempfile::TempDir;
 
@@ -430,6 +438,36 @@ mod tests {
         .to_string()
     }
 
+    struct NoReadAfterJson {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    impl NoReadAfterJson {
+        fn new(input: String) -> Self {
+            Self {
+                bytes: input.into_bytes(),
+                offset: 0,
+            }
+        }
+    }
+
+    impl Read for NoReadAfterJson {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            assert!(
+                self.offset < self.bytes.len(),
+                "hook parser tried to read after the first JSON event"
+            );
+            let len = (self.bytes.len() - self.offset).min(buf.len());
+            buf[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
+        }
+    }
+
     // ── self-gate: tack-only repo → deny ─────────────────────────────────────
 
     #[test]
@@ -454,6 +492,15 @@ mod tests {
             reason.contains("tack"),
             "reason must mention tack: {reason}"
         );
+    }
+
+    #[test]
+    fn parses_first_json_event_without_waiting_for_eof() {
+        let dir = make_tack_only_dir();
+        let input = NoReadAfterJson::new(make_event("Bash", "git status", dir.path()));
+        let mut out = Vec::new();
+        pre_tool_use(input, &mut out).expect("should not error");
+        assert!(!out.is_empty(), "expected deny output");
     }
 
     #[test]
